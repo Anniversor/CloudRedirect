@@ -3840,15 +3840,18 @@ static bool IsSelfUnlockingLua(const std::string& filePath, uint32_t appId) {
 
 // DLL auto-update: check GitHub for a newer cloud_redirect.dll, replace on disk.
 
-static bool ParseVersion(const std::string& s, int out[3]) {
+static bool ParseVersion(const std::string& s, int out[4]) {
     // "2.0.3" or "v2.0.3" ΓåÆ {2, 0, 3}
     const char* p = s.c_str();
     if (*p == 'v' || *p == 'V') ++p;
-    return sscanf(p, "%d.%d.%d", &out[0], &out[1], &out[2]) == 3;
+    // Fork releases carry a fourth revision component (vX.Y.Z.N); it is 0 for
+    // plain upstream versions so both schemes compare sensibly.
+    out[3] = 0;
+    return sscanf(p, "%d.%d.%d.%d", &out[0], &out[1], &out[2], &out[3]) >= 3;
 }
 
-static bool IsNewerVersion(const int remote[3], const int local[3]) {
-    for (int i = 0; i < 3; i++) {
+static bool IsNewerVersion(const int remote[4], const int local[4]) {
+    for (int i = 0; i < 4; i++) {
         if (remote[i] > local[i]) return true;
         if (remote[i] < local[i]) return false;
     }
@@ -4006,7 +4009,7 @@ static void TryAutoUpdateDll() {
         if (tag.empty()) continue;
         if (IsPrereleaseTag(tag)) continue;
 
-        int ver[3] = {};
+        int ver[4] = {};
         if (!ParseVersion(tag, ver)) continue;
 
         auto& assets = rel["assets"];
@@ -4037,7 +4040,7 @@ static void TryAutoUpdateDll() {
     LOG("[AutoUpdate] Latest release: %s", bestTag.c_str());
 
     // Only update to a newer version.
-    int localVer[3] = {}, remoteVer[3] = {};
+    int localVer[4] = {}, remoteVer[4] = {};
     if (ParseVersion(CR_RELEASE_VERSION, localVer) && ParseVersion(bestTag, remoteVer)) {
         if (!IsNewerVersion(remoteVer, localVer)) {
             LOG("[AutoUpdate] DLL is up to date (version match: %s)", CR_RELEASE_VERSION);
