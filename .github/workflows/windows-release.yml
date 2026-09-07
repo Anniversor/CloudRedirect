@@ -2,7 +2,7 @@ name: Windows build and release
 
 # Builds the native x64 DLL/CLI and the 32-bit 760 tool with MSVC, publishes the
 # single-file WPF app, and for vX.Y.Z[.N] tags creates a GitHub release with the
-# same asset layout as upstream. Linux/Flatpak builds are not covered here.
+# same asset layout as upstream. Linux/Flatpak builds live in linux-release.yml.
 
 on:
   push:
