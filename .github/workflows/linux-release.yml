@@ -6,10 +6,11 @@ name: Linux build and release
 # GPG-signed Flatpak repo to GitHub Pages (the update channel the Linux app and
 # the Steam Deck use) plus the bundle and the raw binaries on the GitHub release.
 #
-# Signing needs the FLATPAK_GPG_PRIVATE_KEY repository secret (armored private
-# key, no passphrase). Without it the Flatpak is still built and attached to the
-# release as an unsigned bundle, but the repo is not published: the Linux app
-# refuses update remotes without a GPG key, so an unsigned repo is useless.
+# Signing uses the FLATPAK_GPG_PRIVATE_KEY repository secret (armored private
+# key, no passphrase) when it exists. Without it the repo and the bundle are
+# published unsigned: 'flatpak remote-add --no-gpg-verify' still works as an
+# update channel, only the Linux app's own "enable auto-updates" prompt (which
+# needs a GPG key in the descriptor) stays off.
 
 on:
   push:
@@ -147,7 +148,7 @@ jobs:
         run: |
           set -e
           if [ -z "$FLATPAK_GPG_PRIVATE_KEY" ]; then
-            echo "::warning::FLATPAK_GPG_PRIVATE_KEY is not set: building an unsigned bundle, the Flatpak repo will not be published"
+            echo "::warning::FLATPAK_GPG_PRIVATE_KEY is not set: the Flatpak repo and bundle are published unsigned (add the remote with --no-gpg-verify)"
             echo "keyid=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -191,12 +192,12 @@ jobs:
           cache-key: flatpak-builder-${{ github.sha }}
           upload-artifact: false
 
-      - name: Sign the repo summary and generate static deltas
-        if: steps.gpg.outputs.keyid != ''
+      - name: Update the repo summary (signed when a key is present) and generate static deltas
         run: |
           set -e
-          flatpak build-update-repo --gpg-sign='${{ steps.gpg.outputs.keyid }}' \
-            --generate-static-deltas --prune --prune-depth=4 site/repo
+          sign=()
+          [ -z '${{ steps.gpg.outputs.keyid }}' ] || sign=(--gpg-sign='${{ steps.gpg.outputs.keyid }}')
+          flatpak build-update-repo "${sign[@]}" --generate-static-deltas --prune --prune-depth=4 site/repo
           cp flatpak/cloudredirect.flatpakrepo site/cloudredirect.flatpakrepo
           cp flatpak/cloud_redirect_icon.svg site/repo/icon.svg
           cp flatpak/icons/256x256/apps/cloudredirect.png site/repo/icon.png
@@ -213,7 +214,6 @@ jobs:
           if-no-files-found: error
 
       - name: Upload the Pages site
-        if: steps.gpg.outputs.keyid != ''
         uses: actions/upload-artifact@v5
         with:
           name: linux-pages-site
@@ -233,14 +233,13 @@ jobs:
           path: out
 
       - name: Publish the Flatpak repo to GitHub Pages
-        if: needs.flatpak.outputs.signed == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: out/linux-pages-site
           publish_branch: gh-pages
           force_orphan: true
-          commit_message: 'Publish signed Flatpak repo for ${{ github.ref_name }}'
+          commit_message: 'Publish Flatpak repo for ${{ github.ref_name }} (signed: ${{ needs.flatpak.outputs.signed }})'
 
       - name: Collect release assets with bare sha256 files
         run: |
