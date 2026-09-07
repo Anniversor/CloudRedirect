@@ -442,6 +442,38 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     add_test(NAME stats_store_tests COMMAND stats_store_tests)
 endif()
 
+# ── Fork tests (tests-fork/) ────────────────────────────────────────────
+# Pure-logic regression tests for the cross-device playtime merge. Kept outside
+# tests/ (gitignored upstream) so they are versioned and run by CI.
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests-fork/stats_store_fork_tests.cpp)
+    add_executable(stats_store_fork_tests
+        tests-fork/stats_store_fork_tests.cpp
+        src/common/stats_store.cpp
+        src/common/json.cpp
+        src/common/metadata_sync.cpp
+        src/common/vdf.cpp
+    )
+    target_include_directories(stats_store_fork_tests PRIVATE src/common)
+    target_compile_definitions(stats_store_fork_tests PRIVATE CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+    if(WIN32)
+        target_include_directories(stats_store_fork_tests PRIVATE src/platform/win)
+        target_sources(stats_store_fork_tests PRIVATE
+            src/platform/win/log.cpp
+            src/platform/win/platform_win.cpp
+        )
+        target_link_libraries(stats_store_fork_tests PRIVATE Shlwapi Advapi32 Crypt32 Shell32 Ole32)
+    else()
+        target_include_directories(stats_store_fork_tests PRIVATE src/platform/linux)
+        target_sources(stats_store_fork_tests PRIVATE
+            src/platform/linux/log.cpp
+            src/platform/linux/platform_linux.cpp
+            src/platform/linux/file_util.cpp
+        )
+        target_link_libraries(stats_store_fork_tests PRIVATE pthread dl)
+    endif()
+    add_test(NAME stats_store_fork_tests COMMAND stats_store_fork_tests)
+endif()
+
 # ── UI (Windows only) ───────────────────────────────────────────────────
 
 if(WIN32)

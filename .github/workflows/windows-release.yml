@@ -96,6 +96,14 @@ jobs:
           cmake --build build --config Release --target cloud_redirect cloud_redirect_cli
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+      - name: Build and run fork unit tests
+        shell: pwsh
+        run: |
+          cmake --build build --config Release --target stats_store_fork_tests
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/Release/stats_store_fork_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Build native x86 (cloud760_tool.exe)
         shell: pwsh
         run: |

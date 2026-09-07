@@ -414,6 +414,78 @@ static uint32_t Crc32(const uint8_t* data, size_t len) {
 }
 
 // Seed playtime from localconfig.vdf (catches sessions without CR loaded).
+// The synthetic "__migrated_localconfig" bucket holds playtime Steam counted
+// before CloudRedirect tracked it. Each platform's field is owned by devices of
+// that platform (recomputed from their own localconfig.vdf every launch, never
+// adopted from the cloud); the other platforms' fields can only come from other
+// devices and are adopted in MergePlaytime.
+static const char* const kMigratedLocalconfigBucket = "__migrated_localconfig";
+
+// Steam's Playtime is treated as an upper bound that may already include
+// everything in the other buckets (real devices and the migrated bucket's
+// other-platform fields), so only the excess lands in our own field. The total
+// therefore never exceeds max(Steam's figure, everything CloudRedirect knows)
+// and can never double-count, whichever of the two Steam's figure really is.
+void ApplyLocalconfigPlaytime(uint32_t appId, PlaytimeData& pt,
+                              uint32_t vdfPlaytime, uint32_t vdfPlaytime2wks) {
+    uint64_t otherTotal = 0;
+    for (const auto& [dev, dp] : pt.perDevice) {
+        if (dev == kMigratedLocalconfigBucket) {
+            // Other platforms' fields are other devices' minutes; they count
+            // toward what Steam's figure may already include.
+#ifdef _WIN32
+            otherTotal += (uint64_t)dp.mac + dp.lin;
+#elif defined(__APPLE__)
+            otherTotal += (uint64_t)dp.windows + dp.lin;
+#else
+            otherTotal += (uint64_t)dp.windows + dp.mac;
+#endif
+        } else {
+            otherTotal += (uint64_t)dp.windows + dp.mac + dp.lin;
+        }
+    }
+    uint32_t shortfall = (vdfPlaytime > otherTotal)
+        ? (uint32_t)(vdfPlaytime - otherTotal) : 0u;
+    LOG("[Stats] Reconcile app=%u: vdfPlaytime=%u otherTotal=%llu shortfall=%u (perDevice=%zu, forever_before=%u)",
+        appId, vdfPlaytime, (unsigned long long)otherTotal, shortfall,
+        pt.perDevice.size(), pt.minutesForever);
+    auto mit = pt.perDevice.find(kMigratedLocalconfigBucket);
+    if (shortfall > 0) {
+        DevicePlaytime& mig = (mit != pt.perDevice.end())
+            ? mit->second : pt.perDevice[kMigratedLocalconfigBucket];
+#ifdef _WIN32
+        mig.windows = shortfall;
+#elif defined(__APPLE__)
+        mig.mac = shortfall;
+#else
+        mig.lin = shortfall;
+#endif
+    } else if (mit != pt.perDevice.end()) {
+        // No shortfall for this platform: clear only our own field. The other
+        // platforms' fields are other devices' pre-tracking minutes adopted from
+        // the cloud and must survive (upstream erased the whole bucket here,
+        // which made a Steam Deck's hours vanish from a Windows box on every
+        // launch). Drop the bucket only once nothing is left in it.
+        DevicePlaytime& mig = mit->second;
+#ifdef _WIN32
+        mig.windows = 0;
+#elif defined(__APPLE__)
+        mig.mac = 0;
+#else
+        mig.lin = 0;
+#endif
+        if (mig.windows == 0 && mig.mac == 0 && mig.lin == 0)
+            pt.perDevice.erase(mit);
+    }
+    // Only a floor while we have no day buckets of our own. Steam leaves
+    // Playtime2wks at 0 for namespace apps (its server never sees them), so
+    // this is a no-op there -- and once day tracking is live the derived value
+    // must stay free to shrink.
+    if (!pt.daysTracked)
+        pt.minutesLastTwoWeeks = (std::max)(pt.minutesLastTwoWeeks, vdfPlaytime2wks);
+    RecomputePlaytimeTotals(pt, /*allowShrink=*/true);
+}
+
 static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string& steamPath) {
     std::error_code ec;
     fs::path userdataDir = fs::path(steamPath) / "userdata";
@@ -504,54 +576,10 @@ static void ReconcileLocalConfig(const std::string& cloudRoot, const std::string
             }
 
             // Recompute migrated bucket shortfall (repairs double-counted totals).
-            static const std::string kMigratedBucket = "__migrated_localconfig";
             if (vdfPlaytime > 0) {
-                uint64_t otherTotal = 0;
-                for (const auto& [dev, dp] : stats.playtime.perDevice) {
-                    if (dev == kMigratedBucket) {
-                        // Include other platforms' fields from the migrated bucket
-                        // to prevent double-counting across platforms.
-#ifdef _WIN32
-                        otherTotal += (uint64_t)dp.mac + dp.lin;
-#elif defined(__APPLE__)
-                        otherTotal += (uint64_t)dp.windows + dp.lin;
-#else
-                        otherTotal += (uint64_t)dp.windows + dp.mac;
-#endif
-                    } else {
-                        otherTotal += (uint64_t)dp.windows + dp.mac + dp.lin;
-                    }
-                }
-                uint32_t shortfall = (vdfPlaytime > otherTotal)
-                    ? (uint32_t)(vdfPlaytime - otherTotal) : 0u;
-                LOG("[Stats] Reconcile app=%u: vdfPlaytime=%u otherTotal=%llu shortfall=%u (perDevice=%zu, forever_before=%u)",
-                    appId, vdfPlaytime, (unsigned long long)otherTotal, shortfall,
-                    stats.playtime.perDevice.size(), stats.playtime.minutesForever);
-                if (shortfall > 0) {
-                    DevicePlaytime& mig = stats.playtime.perDevice[kMigratedBucket];
-#ifdef _WIN32
-                    mig.windows = shortfall;
-#elif defined(__APPLE__)
-                    mig.mac = shortfall;
-#else
-                    mig.lin = shortfall;
-#endif
-                } else {
-                    // No shortfall: real device buckets already cover the vdf
-                    // playtime. Don't leave (or create) an empty synthetic bucket.
-                    stats.playtime.perDevice.erase(kMigratedBucket);
-                }
-                // Only a floor while we have no day buckets of our own. Steam
-                // leaves Playtime2wks at 0 for namespace apps (its server never
-                // sees them), so this is a no-op there -- and once day tracking
-                // is live the derived value must stay free to shrink.
-                if (!stats.playtime.daysTracked)
-                    stats.playtime.minutesLastTwoWeeks =
-                        (std::max)(stats.playtime.minutesLastTwoWeeks, vdfPlaytime2wks);
-                RecomputePlaytimeTotals(stats.playtime, /*allowShrink=*/true);
+                ApplyLocalconfigPlaytime(appId, stats.playtime, vdfPlaytime, vdfPlaytime2wks);
                 changed = true;
             }
-
             if (!changed) return true;
 
             RecomputePlaytimeTotals(stats.playtime, /*allowShrink=*/true);
@@ -1285,6 +1313,36 @@ static void MergePlaytime(PlaytimeData& dst, const PlaytimeData& src) {
         // under the last-writer-wins blob.
         for (const auto& [day, mins] : sdp.days)
             ddp.days[day] = (std::max)(ddp.days[day], mins);
+    }
+
+    // The migrated bucket's own-platform field is reconcile-owned (recomputed
+    // from this device's localconfig.vdf, never adopted). Its OTHER platforms'
+    // fields can only come from devices on those platforms, so adopt them (max):
+    // without this a Steam Deck's pre-tracking minutes never reach a Windows
+    // box, or vice versa. Max keeps both merge directions safe: pushing to the
+    // cloud can never zero another platform's field, pulling can only grow it.
+    if (auto sit = src.perDevice.find(kMigratedLocalconfigBucket); sit != src.perDevice.end()) {
+        const DevicePlaytime& smig = sit->second;
+#ifdef _WIN32
+        bool hasOther = smig.mac > 0 || smig.lin > 0;
+#elif defined(__APPLE__)
+        bool hasOther = smig.windows > 0 || smig.lin > 0;
+#else
+        bool hasOther = smig.windows > 0 || smig.mac > 0;
+#endif
+        if (hasOther) {
+            DevicePlaytime& dmig = dst.perDevice[kMigratedLocalconfigBucket];
+#ifdef _WIN32
+            dmig.mac = (std::max)(dmig.mac, smig.mac);
+            dmig.lin = (std::max)(dmig.lin, smig.lin);
+#elif defined(__APPLE__)
+            dmig.windows = (std::max)(dmig.windows, smig.windows);
+            dmig.lin     = (std::max)(dmig.lin,     smig.lin);
+#else
+            dmig.windows = (std::max)(dmig.windows, smig.windows);
+            dmig.mac     = (std::max)(dmig.mac,     smig.mac);
+#endif
+        }
     }
 
     // Per-platform sums of already-attributed minutes, for the legacy discount.
