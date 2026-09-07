@@ -30,7 +30,7 @@ jobs:
     runs-on: windows-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -49,7 +49,7 @@ jobs:
           Write-Host "ReleaseVersion set to $version"
 
       - name: Setup .NET 8
-        uses: actions/setup-dotnet@v4
+        uses: actions/setup-dotnet@v5
         with:
           dotnet-version: '8.0.x'
 
@@ -67,11 +67,24 @@ jobs:
           ./.github/scripts/extract-embedded-pe.ps1 -Exe upstream-exe/CloudRedirect.exe -OutFile ui/native/steam_api.dll -Machine 0x14C -Dll -ExpectedSha256 $env:STEAM_API_DLL_SHA256
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
+      - name: Detect Visual Studio generator
+        id: vs
+        shell: pwsh
+        run: |
+          # windows-latest moved from VS 2022 to VS 2026, so ask vswhere instead of hard-coding "Visual Studio 17 2022".
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
+          if (-not $vs) { throw 'No Visual Studio instance with the C++ x86/x64 toolchain was found' }
+          $major = [int]$vs[0].installationVersion.Split('.')[0]
+          $generator = "Visual Studio $major $($vs[0].catalog.productLineVersion)"
+          Write-Host "Using '$generator' from $($vs[0].installationPath)"
+          "generator=$generator" >> $env:GITHUB_OUTPUT
+
       - name: Build native x64 (cloud_redirect.dll, cloud_redirect_cli.exe)
         shell: pwsh
         run: |
           $sha = '${{ github.sha }}'.Substring(0, 7)
-          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DCR_GIT_SHA=$sha"
+          cmake -S . -B build -G "${{ steps.vs.outputs.generator }}" -A x64 "-DCR_GIT_SHA=$sha"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build --config Release --target cloud_redirect cloud_redirect_cli
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -80,7 +93,7 @@ jobs:
         shell: pwsh
         run: |
           $sha = '${{ github.sha }}'.Substring(0, 7)
-          cmake -S . -B build32 -G "Visual Studio 17 2022" -A Win32 "-DCR_GIT_SHA=$sha"
+          cmake -S . -B build32 -G "${{ steps.vs.outputs.generator }}" -A Win32 "-DCR_GIT_SHA=$sha"
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           cmake --build build32 --config Release --target cloud760_tool
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
@@ -120,7 +133,7 @@ jobs:
           (Get-Item dist/CloudRedirect.exe).VersionInfo | Format-List FileVersion, ProductVersion
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: CloudRedirect-windows-${{ github.sha }}
           path: dist/*
