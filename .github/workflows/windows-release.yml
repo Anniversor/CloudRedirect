@@ -1,0 +1,134 @@
+name: Windows build and release
+
+# Builds the native x64 DLL/CLI and the 32-bit 760 tool with MSVC, publishes the
+# single-file WPF app, and for vX.Y.Z[.N] tags creates a GitHub release with the
+# same asset layout as upstream. Linux/Flatpak builds are not covered here.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # ui/native/steam_api.dll is deliberately untracked. Every upstream release
+  # embeds it in CloudRedirect.exe, so CI pulls it out of this pinned release
+  # (see .github/scripts/extract-embedded-pe.ps1) and refuses to build if either
+  # hash changes. Bump all three values together.
+  UPSTREAM_REPO: Selectively11/CloudRedirect
+  UPSTREAM_EXE_TAG: v2.6.5
+  UPSTREAM_EXE_SHA256: d12a85aec6445b96b7777642d58c2412c236623de7f21ed5d8adb65d771d9f23
+  STEAM_API_DLL_SHA256: 5b6ef90f822209180ed5cafecb90af849ee84bcf6281eeb21be2f89b3b5c89b6
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set release version from tag (not committed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tag = '${{ github.ref_name }}'
+          if (-not ($tag -match '^v(\d+\.\d+\.\d+(\.\d+)?)$')) {
+            throw "Tag '$tag' must look like vX.Y.Z (upstream version) or vX.Y.Z.N (fork revision)"
+          }
+          $version = $Matches[1]
+          $props = Get-Content Version.props -Raw
+          $props = $props -replace '<ReleaseVersion>[^<]*</ReleaseVersion>', "<ReleaseVersion>$version</ReleaseVersion>"
+          Set-Content Version.props -Value $props -NoNewline
+          Write-Host "ReleaseVersion set to $version"
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Fetch steam_api.dll from the pinned upstream release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download $env:UPSTREAM_EXE_TAG -R $env:UPSTREAM_REPO -p CloudRedirect.exe -D upstream-exe --clobber
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $sha = (Get-FileHash upstream-exe/CloudRedirect.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne $env:UPSTREAM_EXE_SHA256) {
+            throw "Upstream CloudRedirect.exe sha256 $sha does not match the pinned $env:UPSTREAM_EXE_SHA256"
+          }
+          ./.github/scripts/extract-embedded-pe.ps1 -Exe upstream-exe/CloudRedirect.exe -OutFile ui/native/steam_api.dll -Machine 0x14C -Dll -ExpectedSha256 $env:STEAM_API_DLL_SHA256
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build native x64 (cloud_redirect.dll, cloud_redirect_cli.exe)
+        shell: pwsh
+        run: |
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 "-DCR_GIT_SHA=$sha"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --config Release --target cloud_redirect cloud_redirect_cli
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Build native x86 (cloud760_tool.exe)
+        shell: pwsh
+        run: |
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          cmake -S . -B build32 -G "Visual Studio 17 2022" -A Win32 "-DCR_GIT_SHA=$sha"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build32 --config Release --target cloud760_tool
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Copy-Item build32/Release/cloud760_tool.exe ui/native/cloud760_tool.exe
+
+      - name: Publish UI (single-file, framework-dependent)
+        run: dotnet publish ui/CloudRedirect.csproj -c Release -r win-x64 --self-contained false -o ui/bin/publish
+
+      - name: Verify the bundle embeds every native component
+        shell: pwsh
+        run: |
+          $exe = 'ui/bin/publish/CloudRedirect.exe'
+          $checks = @(
+            @{ File = 'build/Release/cloud_redirect.dll';     Machine = 0x8664; Dll = $true  },
+            @{ File = 'build/Release/cloud_redirect_cli.exe'; Machine = 0x8664; Dll = $false },
+            @{ File = 'build32/Release/cloud760_tool.exe';    Machine = 0x14C;  Dll = $false },
+            @{ File = 'ui/native/steam_api.dll';              Machine = 0x14C;  Dll = $true  }
+          )
+          foreach ($c in $checks) {
+            $sha = (Get-FileHash $c.File -Algorithm SHA256).Hash.ToLowerInvariant()
+            ./.github/scripts/extract-embedded-pe.ps1 -Exe $exe -OutFile "verify/$(Split-Path $c.File -Leaf)" -Machine $c.Machine -Dll:$c.Dll -ExpectedSha256 $sha
+            if ($LASTEXITCODE) { throw "$($c.File) is not embedded in $exe" }
+          }
+
+      - name: Collect release assets
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item ui/bin/publish/CloudRedirect.exe dist/
+          Copy-Item build/Release/cloud_redirect.dll dist/
+          foreach ($f in Get-ChildItem dist -File) {
+            # Bare hash only: the in-app updater ignores .sha256 files that are not exactly 64 characters.
+            $h = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            Set-Content -Path "$($f.FullName).sha256" -Value $h -NoNewline
+          }
+          Get-ChildItem dist | Format-Table Name, Length -AutoSize
+          (Get-Item dist/CloudRedirect.exe).VersionInfo | Format-List FileVersion, ProductVersion
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: CloudRedirect-windows-${{ github.sha }}
+          path: dist/*
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: dist/*
