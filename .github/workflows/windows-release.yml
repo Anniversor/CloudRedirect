@@ -76,7 +76,9 @@ jobs:
           $vs = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -format json | ConvertFrom-Json
           if (-not $vs) { throw 'No Visual Studio instance with the C++ x86/x64 toolchain was found' }
           $major = [int]$vs[0].installationVersion.Split('.')[0]
-          $generator = "Visual Studio $major $($vs[0].catalog.productLineVersion)"
+          # Let CMake supply the exact generator name for that major (e.g. "Visual Studio 18 2026").
+          $generator = (cmake --help | Select-String -Pattern "Visual Studio $major \d{4}" | Select-Object -First 1).Matches[0].Value
+          if (-not $generator) { throw "CMake does not know a Visual Studio $major generator" }
           Write-Host "Using '$generator' from $($vs[0].installationPath)"
           "generator=$generator" >> $env:GITHUB_OUTPUT
 
