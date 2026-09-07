@@ -231,8 +231,12 @@ OneDriveProvider::DownloadFileById(const std::string& itemId) {
 }
 
 std::vector<ICloudProvider::SearchHit>
-OneDriveProvider::SearchByName(const std::string& filename, bool* outSupported) {
+OneDriveProvider::SearchByName(const std::string& filename, bool* outSupported,
+                               bool* outComplete, const SearchFilter& wantContent) {
     if (outSupported) *outSupported = true;
+    // Graph search is served from an index that can lag behind uploads, so a
+    // file absent from the result may still exist: never claim completeness.
+    if (outComplete) *outComplete = false;
     std::vector<SearchHit> hits;
 
     // Graph search. Each hit's parentReference.path is like
@@ -276,11 +280,13 @@ OneDriveProvider::SearchByName(const std::string& filename, bool* outSupported) 
             for (char c : appId)     if (c < '0' || c > '9') { ok = false; break; }
             if (!ok) continue;
 
+            std::string path = accountId + "/" + appId + "/" + filename;
+            if (wantContent && !wantContent(path)) continue;   // seen, not wanted
             auto content = DownloadFileById(item["id"].str());
             if (!content || content->empty()) continue;
 
             SearchHit hit;
-            hit.path = accountId + "/" + appId + "/" + filename;
+            hit.path = std::move(path);
             hit.content = std::move(*content);
             hits.push_back(std::move(hit));
         }

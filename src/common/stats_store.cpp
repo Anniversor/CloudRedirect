@@ -44,6 +44,7 @@ static CloudPushAllFn g_cloudPushAll;
 static CloudPullLegacyFn g_cloudPullLegacy;
 // Reads a single first-format playtime blob (Playtime/<appId>.bin) from the cloud.
 static CloudPullLegacyPlaytimeFn g_cloudPullLegacyPlaytime;
+static CloudListLegacyFn g_cloudListLegacy;
 
 // Cached account blob (appId -> stats JSON). Guarded by g_mutex.
 static std::unordered_map<uint32_t, std::string> g_cloudBlobByApp;
@@ -107,6 +108,11 @@ void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll,
     g_cloudPushAll = std::move(pushAll);
     g_cloudPullLegacy = std::move(pullLegacy);
     g_cloudPullLegacyPlaytime = std::move(pullLegacyPlaytime);
+}
+
+void SetCloudLegacyLister(CloudListLegacyFn lister) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_cloudListLegacy = std::move(lister);
 }
 
 // Pull account blob into g_cloudBlobByApp. Caller must NOT hold g_mutex.
@@ -1852,19 +1858,47 @@ void ResetStats(uint32_t appId) {
 // Migrate legacy per-app blobs into the consolidated account blob.
 static void MigrateLegacyBlobs(const std::vector<uint32_t>& appIds) {
     CloudPullLegacyFn pullLegacy;
+    CloudListLegacyFn listLegacy;
     std::vector<uint32_t> missing;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
-        if (!g_cloudPullLegacy) return;
+        if (!g_cloudPullLegacy && !g_cloudListLegacy) return;
         pullLegacy = g_cloudPullLegacy;
+        listLegacy = g_cloudListLegacy;
         for (uint32_t appId : appIds) {
             if (appId == 0) continue;
             if (g_cloudBlobByApp.find(appId) == g_cloudBlobByApp.end())
                 missing.push_back(appId);
         }
     }
+    if (missing.empty()) return;
+    // One search for every legacy blob of the account instead of one probe per
+    // app: most apps never had one, and each probe is a network round-trip that
+    // delays the whole seed. The listing may say "absent" only when it is
+    // complete; otherwise every app it did not return is probed individually,
+    // exactly as before, so nothing is ever skipped for good.
+    std::unordered_map<uint32_t, std::string> listed;
+    bool complete = false;
+    bool listedOk = false;
+    if (listLegacy) {
+        listedOk = listLegacy(missing, listed, complete);   // network, off-lock
+        if (!listedOk) { listed.clear(); complete = false; }
+    }
+    size_t probed = 0, skipped = 0, migrated = 0;
     for (uint32_t appId : missing) {
-        std::string legacy = pullLegacy(appId);   // network, off-lock
+        std::string legacy;
+        auto found = listed.find(appId);
+        if (found != listed.end()) {
+            legacy = found->second;
+        } else if (listedOk && complete) {
+            ++skipped;
+            continue;
+        } else if (pullLegacy) {
+            legacy = pullLegacy(appId);   // network, off-lock
+            ++probed;
+        } else {
+            continue;
+        }
         if (legacy.empty()) continue;
         AppStats parsed;
         if (!ParseAppStatsJson(legacy, parsed)) continue;
@@ -1873,9 +1907,14 @@ static void MigrateLegacyBlobs(const std::vector<uint32_t>& appIds) {
         if (g_cloudBlobByApp.find(appId) != g_cloudBlobByApp.end()) continue;
         g_cloudBlobByApp[appId] = legacy;
         g_accountBlobDirty = true;
+        ++migrated;
         LOG("[Stats] Migrated legacy per-app blob for app %u (forever=%u)",
             appId, parsed.playtime.minutesForever);
     }
+    LOG("[Stats] Legacy blob scan: %zu candidate(s), listing %s (%zu hit(s), complete=%d), "
+        "%zu probed, %zu skipped, %zu migrated",
+        missing.size(), listLegacy ? (listedOk ? "ok" : "failed") : "n/a",
+        listed.size(), (int)complete, probed, skipped, migrated);
 }
 
 // Parse the first-format playtime JSON ({"LastPlayed","Playtime","Playtime2wks"}).

@@ -3,6 +3,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
+#include <functional>
 #include <memory>
 
 // Cloud storage provider interface.
@@ -89,10 +90,21 @@ public:
         std::vector<uint8_t> content;
     };
 
+    // Optional filter for SearchByName: a match whose path ("{accountId}/{appId}/
+    // {filename}") it rejects is left out of the result without being downloaded.
+    using SearchFilter = std::function<bool(const std::string& path)>;
+
     // Search account for exact filename matches. Default: unsupported (callers fall back to listing).
+    // *outComplete is true only when the result is authoritative: every match under
+    // the CloudRedirect root was seen, and every wanted one was read, so a wanted
+    // file absent from the result does not exist. Providers whose search is
+    // index-based (may lag behind uploads) or that hit any error leave it false.
     virtual std::vector<SearchHit> SearchByName(const std::string& /*filename*/,
-                                                bool* outSupported = nullptr) {
+                                                bool* outSupported = nullptr,
+                                                bool* outComplete = nullptr,
+                                                const SearchFilter& /*wantContent*/ = nullptr) {
         if (outSupported) *outSupported = false;
+        if (outComplete) *outComplete = false;
         return {};
     }
 

@@ -573,28 +573,49 @@ GoogleDriveProvider::DownloadFileById(const std::string& fileId) {
 }
 
 std::vector<ICloudProvider::SearchHit>
-GoogleDriveProvider::SearchByName(const std::string& filename, bool* outSupported) {
+GoogleDriveProvider::SearchByName(const std::string& filename, bool* outSupported,
+                                  bool* outComplete, const SearchFilter& wantContent) {
     if (outSupported) *outSupported = true;
+    if (outComplete) *outComplete = false;
     std::vector<SearchHit> hits;
-
+    // Drive search spans the whole account. Only files under our own CloudRedirect
+    // root count -- the folder every other call resolves through -- so a stale copy
+    // somewhere else in the Drive can never be reported as ours.
+    std::string rootId;
+    auto rootStatus = LookupRootFolder(&rootId);
+    if (rootStatus == LookupStatus::Missing) {
+        // No root folder at all: nothing can exist under it. That is an
+        // authoritative empty answer, not a failure.
+        if (outComplete) *outComplete = true;
+        LOG("[GDrive] SearchByName('%s'): no CloudRedirect root folder", filename.c_str());
+        return hits;
+    }
+    if (rootStatus != LookupStatus::Exists) {
+        LOG("[GDrive] SearchByName('%s'): root folder lookup failed", filename.c_str());
+        if (outSupported) *outSupported = false;
+        return hits;
+    }
     // Per-folder-id name resolution with a tiny local cache (account/app
-    // folders repeat across hits). Returns "" on failure.
-    std::unordered_map<std::string, std::pair<std::string, std::string>> folderInfo; // id -> {name, parentId}
-    auto getFolder = [&](const std::string& id) -> std::pair<std::string, std::string> {
+    // folders repeat across hits). ok=false means the lookup itself failed.
+    struct FolderInfo { bool ok = false; std::string name; std::string parentId; };
+    std::unordered_map<std::string, FolderInfo> folderInfo;
+    auto getFolder = [&](const std::string& id) -> FolderInfo {
         auto it = folderInfo.find(id);
         if (it != folderInfo.end()) return it->second;
         auto r = ApiGet("/drive/v3/files/" + id + "?fields=name,parents");
-        std::pair<std::string, std::string> info;
+        FolderInfo info;
         if (r.status == 200) {
+            info.ok = true;
             auto j = Json::Parse(r.body);
-            info.first = j["name"].str();
+            info.name = j["name"].str();
             auto& parents = j["parents"];
-            if (parents.size() > 0) info.second = parents[(size_t)0].str();
+            if (parents.size() > 0) info.parentId = parents[(size_t)0].str();
         }
         folderInfo[id] = info;
         return info;
     };
-
+    // A match we could not resolve or read makes the result non-authoritative.
+    bool lost = false;
     // Global search for the exact filename.
     std::string q = "name='" + EscapeQuery(filename) + "'"
                     " and mimeType!='application/vnd.google-apps.folder'"
@@ -602,51 +623,50 @@ GoogleDriveProvider::SearchByName(const std::string& filename, bool* outSupporte
     std::string baseUrl = "/drive/v3/files?q=" + UrlEncode(q) +
         "&fields=nextPageToken,files(id,name,parents)&pageSize=1000";
     std::string pageToken;
-
     do {
         std::string url = baseUrl;
         if (!pageToken.empty()) url += "&pageToken=" + UrlEncode(pageToken);
-
         auto r = ApiGet(url);
         if (r.status != 200) {
             LOG("[GDrive] SearchByName('%s'): HTTP %d", filename.c_str(), r.status);
             if (hits.empty() && outSupported) *outSupported = (r.status == 404);
-            return hits;
+            return hits;   // *outComplete stays false: a page is missing
         }
-
         auto j = Json::Parse(r.body);
         auto& files = j["files"];
         for (size_t i = 0; i < files.size(); ++i) {
             std::string fileId = files[i]["id"].str();
             auto& parents = files[i]["parents"];
             if (parents.size() == 0) continue;
-
-            // parent = appId folder, grandparent = accountId folder.
+            // parent = appId folder, grandparent = accountId folder, whose own
+            // parent must be our root folder.
             std::string appFolderId = parents[(size_t)0].str();
-            auto appInfo = getFolder(appFolderId);          // {appId, accountFolderId}
-            if (appInfo.first.empty() || appInfo.second.empty()) continue;
-            auto acctInfo = getFolder(appInfo.second);      // {accountId, rootFolderId}
-            if (acctInfo.first.empty()) continue;
-
+            FolderInfo appInfo = getFolder(appFolderId);
+            if (!appInfo.ok) { lost = true; continue; }
+            if (appInfo.name.empty() || appInfo.parentId.empty()) continue;
+            FolderInfo acctInfo = getFolder(appInfo.parentId);
+            if (!acctInfo.ok) { lost = true; continue; }
+            if (acctInfo.name.empty() || acctInfo.parentId != rootId) continue;
             // Only accept numeric account/app folder names (our layout).
-            bool ok = !appInfo.first.empty() && !acctInfo.first.empty();
-            for (char c : appInfo.first)  if (c < '0' || c > '9') { ok = false; break; }
-            for (char c : acctInfo.first) if (c < '0' || c > '9') { ok = false; break; }
+            bool ok = true;
+            for (char c : appInfo.name)  if (c < '0' || c > '9') { ok = false; break; }
+            for (char c : acctInfo.name) if (c < '0' || c > '9') { ok = false; break; }
             if (!ok) continue;
-
+            std::string path = acctInfo.name + "/" + appInfo.name + "/" + filename;
+            if (wantContent && !wantContent(path)) continue;   // seen, not wanted
             auto content = DownloadFileById(fileId);
-            if (!content || content->empty()) continue;
-
+            if (!content) { lost = true; continue; }
+            if (content->empty()) continue;
             SearchHit hit;
-            hit.path = acctInfo.first + "/" + appInfo.first + "/" + filename;
+            hit.path = std::move(path);
             hit.content = std::move(*content);
             hits.push_back(std::move(hit));
         }
-
         pageToken = j["nextPageToken"].str();
     } while (!pageToken.empty());
-
-    LOG("[GDrive] SearchByName('%s'): %zu match(es)", filename.c_str(), hits.size());
+    if (outComplete) *outComplete = !lost;
+    LOG("[GDrive] SearchByName('%s'): %zu match(es)%s", filename.c_str(), hits.size(),
+        lost ? " (incomplete)" : "");
     return hits;
 }
 

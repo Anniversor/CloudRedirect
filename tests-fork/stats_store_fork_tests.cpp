@@ -1,12 +1,21 @@
-// Fork regression tests for cross-device playtime (stats_store.cpp:
-// ApplyLocalconfigPlaytime and the migrated-bucket adoption in MergePlaytime).
+// Fork regression tests for stats_store.cpp: cross-device playtime
+// (ApplyLocalconfigPlaytime and the migrated-bucket adoption in MergePlaytime)
+// and the legacy per-app blob migration in SeedApps.
 // No framework: each CHECK reports a failure with file/line; the exit code is
 // the number of failures. Built and run by .github/workflows/windows-release.yml.
 #include "stats_store.h"
 #include "json.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <cstdio>
+#include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <system_error>
+#include <unordered_map>
+#include <vector>
 
 using StatsStore::DevicePlaytime;
 using StatsStore::PlaytimeData;
@@ -222,6 +231,163 @@ static void PullThenReconcileShowsDeckHours() {
     CHECK(Other(pt.perDevice[kMigrated]) == 1597);
 }
 
+// ---- Legacy per-app blob migration (SeedApps -> MigrateLegacyBlobs) ---------
+//
+// Drives the real seed against in-memory cloud callbacks. The account blob knows
+// app 100; apps 200 and 300 have no entry there, so they are the candidates for
+// a legacy per-app blob. Each case records which apps the store still probed one
+// by one and what the seed pushed back into the account blob.
+
+using BlobMap = std::unordered_map<uint32_t, std::string>;
+
+struct SeedRun {
+    std::mutex mtx;
+    std::condition_variable cv;
+    std::vector<uint32_t> probed;   // pullLegacy calls, in order
+    std::vector<uint32_t> asked;    // apps the lister was asked about
+    BlobMap pushed;                 // last pushAll snapshot
+    bool pushSeen = false;
+
+    // The account blob is pushed from a detached thread; wait for it (bounded).
+    bool WaitForPush() {
+        std::unique_lock<std::mutex> lock(mtx);
+        return cv.wait_for(lock, std::chrono::seconds(10), [this] { return pushSeen; });
+    }
+};
+
+static std::vector<std::filesystem::path> g_tempRoots;
+
+// A legacy per-app entry whose minutes are unmistakable in a snapshot.
+static std::string Legacy(uint32_t forever) {
+    return Entry(Dev("olddevice", forever, 0), forever);
+}
+
+static std::string AccountEntry(uint32_t forever) {
+    return Entry(Dev("steamdeck", 0, forever), forever);
+}
+
+static uint32_t SeededMinutes(uint32_t appId) {
+    return StatsStore::Snapshot(appId).playtime.minutesForever;
+}
+
+// Runs SeedApps({100, 200, 300}) on a fresh store rooted in a temp directory.
+// `listing` == nullptr means no lister is configured; otherwise the lister
+// returns *listing with the given verdict. `probes` is what a per-app probe finds.
+static std::shared_ptr<SeedRun> RunSeed(int caseNo, BlobMap blob, const BlobMap* listing,
+                                        bool listingOk, bool listingComplete, BlobMap probes) {
+    namespace fs = std::filesystem;
+    auto run = std::make_shared<SeedRun>();
+    auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path root = fs::temp_directory_path() /
+        ("cr_fork_tests_" + std::to_string(stamp) + "_" + std::to_string(caseNo));
+    std::error_code ec;
+    fs::create_directories(root / "steam", ec);
+    g_tempRoots.push_back(root);
+
+    StatsStore::ResetForTesting();
+    StatsStore::Init((root / "cloud").string(), (root / "steam").string());
+    StatsStore::SetAccountIdProvider([] { return 1397805883u; });
+    StatsStore::SetCloudProvider(
+        [blob](BlobMap& out) { out = blob; return true; },
+        [run](const BlobMap& all) {
+            std::lock_guard<std::mutex> lock(run->mtx);
+            run->pushed = all;
+            run->pushSeen = true;
+            run->cv.notify_all();
+        },
+        [run, probes](uint32_t appId) -> std::string {
+            {
+                std::lock_guard<std::mutex> lock(run->mtx);
+                run->probed.push_back(appId);
+            }
+            auto it = probes.find(appId);
+            return it == probes.end() ? std::string() : it->second;
+        },
+        [](uint32_t) { return std::string(); });
+    if (listing) {
+        BlobMap copy = *listing;
+        StatsStore::SetCloudLegacyLister(
+            [run, copy, listingOk, listingComplete](const std::vector<uint32_t>& apps,
+                                                    BlobMap& out, bool& complete) {
+                run->asked = apps;
+                out = copy;
+                complete = listingComplete;
+                return listingOk;
+            });
+    } else {
+        StatsStore::SetCloudLegacyLister(nullptr);
+    }
+    StatsStore::SeedApps({100, 200, 300});
+    return run;
+}
+
+// Google Drive's complete listing: the one app that has a legacy blob is
+// migrated straight from the listing and nobody is probed individually.
+static void LegacyListingCompleteMigratesWithoutProbes() {
+    BlobMap listing = {{200, Legacy(777)}};
+    BlobMap probes = {{300, Legacy(999)}};   // must never be consulted
+    auto run = RunSeed(1, {{100, AccountEntry(50)}}, &listing, true, true, probes);
+    CHECK((run->asked == std::vector<uint32_t>{200, 300}));   // never the blob's own apps
+    CHECK(run->probed.empty());
+    CHECK(SeededMinutes(100) == 50);
+    CHECK(SeededMinutes(200) == 777);
+    CHECK(SeededMinutes(300) == 0);
+    CHECK(run->WaitForPush());
+    CHECK(run->pushed.count(200) == 1);
+    CHECK(run->pushed.count(300) == 0);
+}
+
+// A listing that cannot vouch for completeness (a lost page, a failed download)
+// still migrates what it found, and every other candidate is probed exactly as
+// before, so a blob the listing missed is still recovered.
+static void LegacyListingIncompleteProbesTheRest() {
+    BlobMap listing = {{200, Legacy(777)}};
+    BlobMap probes = {{300, Legacy(999)}};
+    auto run = RunSeed(2, {{100, AccountEntry(50)}}, &listing, true, false, probes);
+    CHECK((run->probed == std::vector<uint32_t>{300}));
+    CHECK(SeededMinutes(200) == 777);
+    CHECK(SeededMinutes(300) == 999);
+    CHECK(run->WaitForPush());
+    CHECK(run->pushed.count(200) == 1);
+    CHECK(run->pushed.count(300) == 1);
+}
+
+// A failed listing is ignored entirely, even if it returned something, and the
+// seed behaves exactly like upstream: one probe per candidate.
+static void LegacyListingFailedProbesEveryCandidate() {
+    BlobMap listing = {{200, Legacy(777)}};   // came with "failed": must be ignored
+    BlobMap probes = {{200, Legacy(555)}, {300, Legacy(999)}};
+    auto run = RunSeed(3, {{100, AccountEntry(50)}}, &listing, false, true, probes);
+    CHECK((run->probed == std::vector<uint32_t>{200, 300}));
+    CHECK(SeededMinutes(200) == 555);
+    CHECK(SeededMinutes(300) == 999);
+    CHECK(run->WaitForPush());
+    CHECK(run->pushed.count(200) == 1);
+    CHECK(run->pushed.count(300) == 1);
+}
+
+// No lister at all (S3, local disk, an older wiring): upstream behaviour.
+static void NoLegacyListerProbesEveryCandidate() {
+    BlobMap probes = {{300, Legacy(999)}};
+    auto run = RunSeed(4, {{100, AccountEntry(50)}}, nullptr, false, false, probes);
+    CHECK((run->probed == std::vector<uint32_t>{200, 300}));
+    CHECK(SeededMinutes(200) == 0);
+    CHECK(SeededMinutes(300) == 999);
+    CHECK(run->WaitForPush());
+    CHECK(run->pushed.count(300) == 1);
+}
+
+// The account blob always wins: a stale legacy blob for an app that already
+// has an account-blob entry is neither adopted nor probed for.
+static void LegacyListingNeverOverridesAccountBlob() {
+    BlobMap listing = {{100, Legacy(5000)}};
+    auto run = RunSeed(5, {{100, AccountEntry(50)}}, &listing, true, true, {});
+    CHECK(run->probed.empty());
+    CHECK(SeededMinutes(100) == 50);
+    CHECK(SeededMinutes(200) == 0);
+    CHECK(SeededMinutes(300) == 0);
+}
+
 int main() {
     ReconcileKeepsOtherDevicesMinutes();
     ReconcileAddsShortfallToOwnField();
@@ -236,6 +402,15 @@ int main() {
     MergeDoesNotCreateEmptyMigratedBucket();
     MergeRealDevicesUnchanged();
     PullThenReconcileShowsDeckHours();
+    LegacyListingCompleteMigratesWithoutProbes();
+    LegacyListingIncompleteProbesTheRest();
+    LegacyListingFailedProbesEveryCandidate();
+    NoLegacyListerProbesEveryCandidate();
+    LegacyListingNeverOverridesAccountBlob();
+    for (const auto& root : g_tempRoots) {
+        std::error_code ec;
+        std::filesystem::remove_all(root, ec);
+    }
     std::printf("stats_store_fork_tests: %d passed, %d failed\n", g_passed, g_failed);
     return g_failed;
 }

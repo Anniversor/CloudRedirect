@@ -684,6 +684,39 @@ bool DownloadLegacyPlaytimeBlob(uint32_t accountId, uint32_t appId,
     return g_provider->Download(path, outData) && !outData.empty();
 }
 
+bool ListLegacyStatsBlobs(uint32_t accountId, const std::vector<uint32_t>& appIds,
+                          std::unordered_map<uint32_t, std::string>& out,
+                          bool* outComplete) {
+    out.clear();
+    if (outComplete) *outComplete = false;
+    if (!g_provider || !g_provider->IsAuthenticated()) return false;
+    std::unordered_set<uint32_t> wanted(appIds.begin(), appIds.end());
+    wanted.erase(0);   // the account-scope blob is never a legacy per-app blob
+    const std::string prefix = std::to_string(accountId) + "/";
+    // "<accountId>/<appId>/stats.json" -> appId when it is one of the wanted apps.
+    auto wantedApp = [&](const std::string& path, uint32_t& appId) -> bool {
+        if (path.compare(0, prefix.size(), prefix) != 0) return false;
+        size_t slash = path.find('/', prefix.size());
+        if (slash == std::string::npos) return false;
+        if (!ParseU32(path.substr(prefix.size(), slash - prefix.size()), appId)) return false;
+        if (path.compare(slash + 1, std::string::npos, "stats.json") != 0) return false;
+        return wanted.count(appId) != 0;
+    };
+    bool supported = false, complete = false;
+    auto hits = g_provider->SearchByName("stats.json", &supported, &complete,
+        [&](const std::string& path) { uint32_t appId = 0; return wantedApp(path, appId); });
+    if (!supported) return false;
+    for (auto& h : hits) {
+        uint32_t appId = 0;
+        if (!wantedApp(h.path, appId) || h.content.empty()) continue;
+        out[appId].assign(reinterpret_cast<const char*>(h.content.data()), h.content.size());
+    }
+    if (outComplete) *outComplete = complete;
+    LOG("[CloudStorage] Legacy stats listing: %zu of %zu wanted app(s) found for account %u (complete=%d)",
+        out.size(), wanted.size(), accountId, (int)complete);
+    return true;
+}
+
 static void EnqueueCloudDelete(const std::string& cloudPath) {
     CloudWorkQueue::WorkItem wi;
     wi.type = CloudWorkQueue::WorkItem::Delete;

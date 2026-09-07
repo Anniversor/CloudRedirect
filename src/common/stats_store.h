@@ -22,6 +22,16 @@ using CloudPullLegacyPlaytimeFn = std::function<std::string(uint32_t appId)>;
 void SetCloudProvider(CloudPullAllFn pullAll, CloudPushAllFn pushAll,
                       CloudPullLegacyFn pullLegacy = nullptr,
                       CloudPullLegacyPlaytimeFn pullLegacyPlaytime = nullptr);
+// Fetch the legacy per-app blobs of the given apps in one call (appId -> JSON).
+// Return false when unavailable. Set `complete` only when the listing is
+// authoritative, i.e. a requested app absent from `out` has no legacy blob.
+using CloudListLegacyFn = std::function<bool(const std::vector<uint32_t>& appIds,
+                                             std::unordered_map<uint32_t, std::string>& out,
+                                             bool& complete)>;
+// Optional. Replaces one network probe per app in the legacy migration; apps the
+// listing does not vouch for still go through pullLegacy, so a partial or failed
+// listing never skips anything.
+void SetCloudLegacyLister(CloudListLegacyFn lister);
 
 // Merge strategies for stat values (mirrors Steam's resolution_method + type_int).
 enum class StatMerge : uint8_t {

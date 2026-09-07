@@ -23,7 +23,9 @@ public:
     bool ListChecked(const std::string& prefix, std::vector<FileInfo>& outFiles,
                      bool* outComplete = nullptr) override;
     std::vector<SearchHit> SearchByName(const std::string& filename,
-                                        bool* outSupported = nullptr) override;
+                                        bool* outSupported = nullptr,
+                                        bool* outComplete = nullptr,
+                                        const SearchFilter& wantContent = nullptr) override;
 
 protected:
     // CloudProviderBase hooks

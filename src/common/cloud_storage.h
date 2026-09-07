@@ -8,7 +8,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <atomic>
 #include <unordered_map>
 #include <unordered_set>
@@ -105,6 +107,13 @@ MetadataFetch FetchCloudMetadataStatus(uint32_t accountId, uint32_t appId,
 // <acct>/0/blobs/Playtime/<appId>.bin). False if absent/unavailable. Migration-only.
 bool DownloadLegacyPlaytimeBlob(uint32_t accountId, uint32_t appId,
     std::vector<uint8_t>& outData);
+// Fetch the legacy per-app stats blobs (<accountId>/<appId>/stats.json) of the
+// given apps in a single provider search, as appId -> content; only those blobs
+// are downloaded. False when the provider has no server-side search or the
+// search failed. *outComplete is true only when the provider vouched that the
+// listing is authoritative (an app absent from it has no such blob). Migration-only.
+bool ListLegacyStatsBlobs(uint32_t accountId, const std::vector<uint32_t>& appIds,
+    std::unordered_map<uint32_t, std::string>& out, bool* outComplete = nullptr);
 bool UploadCloudMetadataText(uint32_t accountId, uint32_t appId,
     const char* name, const std::string& content);
 // Queued (thread-safe) variant: serializes on the cloud work queue.

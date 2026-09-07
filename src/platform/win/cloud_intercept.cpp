@@ -4821,6 +4821,18 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
                 return std::string(reinterpret_cast<const char*>(data.data()), data.size());
             return std::string();
         });
+    // One provider search enumerates every legacy per-app blob of the account, so
+    // startup no longer probes each unlocked app one by one. Google Drive vouches
+    // for a complete listing; anything less falls back to the per-app probes.
+    StatsStore::SetCloudLegacyLister(
+        [](const std::vector<uint32_t>& appIds,
+           std::unordered_map<uint32_t, std::string>& out, bool& complete) -> bool {
+            CloudStorage::InflightSyncScope guard;
+            if (!guard.entered) return false;
+            uint32_t accountId = GetAccountId();
+            if (accountId == 0) return false;
+            return CloudStorage::ListLegacyStatsBlobs(accountId, appIds, out, &complete);
+        });
     // Restrict all playtime/stats tracking to namespace/lua apps only -- real
     // owned games must never have their playtime recorded or synced.
     StatsHandlers::SetNamespacePredicate([](uint32_t appId) { return IsNamespaceApp(appId); });
