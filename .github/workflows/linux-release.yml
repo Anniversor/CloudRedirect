@@ -45,7 +45,9 @@ jobs:
           apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make python3-pip
           add-apt-repository -y ppa:ubuntu-toolchain-r/test
           apt-get update
-          apt-get install -y --no-install-recommends gcc-12 g++-12 gcc-12-multilib g++-12-multilib
+          # The unversioned multilib packages also provide the i386 asm/ kernel headers
+          # (asm/errno.h) that a -m32 build needs.
+          apt-get install -y --no-install-recommends gcc-multilib g++-multilib gcc-12 g++-12 gcc-12-multilib g++-12-multilib
           pip3 install --no-cache-dir 'cmake>=3.20'
           cmake --version | head -1
           gcc-12 --version | head -1
