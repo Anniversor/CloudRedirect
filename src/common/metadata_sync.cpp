@@ -10,5 +10,7 @@ std::atomic<bool> syncPlaytime{false};
 // Retired: schema fetching conflicted with non-SteamTools unlock clients. Kept as a
 // no-op flag so config parsing and gate checks compile; SchemaFetchEnabled() is always false.
 std::atomic<bool> schemaFetch{false};
+// Fork: local answers for the achievements page (see metadata_sync.h).
+std::atomic<bool> answerUserStats{true};
 
 }

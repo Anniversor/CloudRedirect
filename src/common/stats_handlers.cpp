@@ -46,9 +46,16 @@ CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<P
     // Snapshot: thread-safe copy taken under the store lock.
     StatsStore::AppStats stats = StatsStore::Snapshot(appId);
 
-    // Without a schema we have nothing authoritative to serve, so pass through.
-    if (stats.schema.empty())
+    if (stats.schema.empty()) {
+        // Without a schema the client discards any stats we send, and answering
+        // at all (even crc-only) hides the request from the unlock client, which
+        // fetches the schema from Steam on the client's behalf (OST spoofs the
+        // request when the client has none). Pass through instead; the native
+        // import adopts the schema once it lands in appcache/stats, and from then
+        // on we answer with our own unlocks.
+        LOG("[Stats] GetUserStats app=%u: no schema in store, passing through", appId);
         return CloudIntercept::RpcResult();
+    }
 
     PB::Writer resp;
 
@@ -63,7 +70,7 @@ CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<P
         return CloudIntercept::RpcResult(std::move(resp));
     }
 
-    // Client stale -- send schema + stats.
+    // Client stale -- send schema + stats (schema presence was checked above).
     resp.WriteBytes(3, stats.schema.data(), stats.schema.size());
     LOG("[Stats]   Sending schema (%zu bytes)", stats.schema.size());
 
