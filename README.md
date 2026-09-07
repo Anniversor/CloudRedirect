@@ -70,7 +70,7 @@ The repo is GPG-signed by CI (the descriptor carries the public key). If you eve
 
 Then open the app, press Update on the dashboard so the bundled `cloud_redirect.so` is deployed, and restart Steam. Every release also carries `CloudRedirect-linux-x86_64.flatpak` for offline installs (`flatpak install --user ./CloudRedirect-linux-x86_64.flatpak`).
 
-If you keep SLSsteam and the pinned Steam client up to date with the [headcrab](https://github.com/Deadboy666/h3adcr-b) script, use this fork's wrapper instead of the "Headcrab Updater" menu entry: it runs headcrab with its CloudRedirect downloads pointed at this fork (the unpatched script overwrites the deployed `cloud_redirect.so` with upstream's build every run), then redeploys the Flatpak's library and installs itself as "CloudRedirect (fork) Updater" in the application menu:
+If you keep SLSsteam and the pinned Steam client up to date with the [headcrab](https://github.com/Deadboy666/h3adcr-b) script, use this fork's wrapper instead of the "Headcrab Updater" menu entry: it runs headcrab behind `wget`/`curl`/`flatpak` shims that send every download of `cloud_redirect.so`, `cloud_redirect_cli` or `cloudredirect.flatpakrepo` to this fork (the shims key on those file names, so they do not care how upstream's script is written or where it hosts the files; the unpatched script overwrites the deployed `cloud_redirect.so` with upstream's build every run), then redeploys the Flatpak's library anyway and installs itself as "CloudRedirect (fork) Updater" in the application menu:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/Anniversor/CloudRedirect/master/linux/deck-update.sh | bash
