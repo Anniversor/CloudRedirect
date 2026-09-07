@@ -177,6 +177,12 @@ void FlushAll();
 // Merge two app-stats JSONs (monotonic playtime, union achievements).
 std::string MergeAppStatsJson(const std::string& base, const std::string& incoming);
 
+// Fold this device's localconfig.vdf Playtime/Playtime2wks into pt's synthetic
+// "__migrated_localconfig" bucket (own-platform field only; the other platforms'
+// fields are other devices' minutes and are preserved). Exposed for tests.
+void ApplyLocalconfigPlaytime(uint32_t appId, PlaytimeData& pt,
+                              uint32_t vdfPlaytime, uint32_t vdfPlaytime2wks);
+
 // Consume the set of apps whose stats were intentionally reset this session.
 // The push path should replace (not merge) these entries in the cloud blob.
 // Returns the set and clears it atomically under the store lock.
