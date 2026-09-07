@@ -70,6 +70,14 @@ The repo is GPG-signed by CI (the descriptor carries the public key). If you eve
 
 Then open the app, press Update on the dashboard so the bundled `cloud_redirect.so` is deployed, and restart Steam. Every release also carries `CloudRedirect-linux-x86_64.flatpak` for offline installs (`flatpak install --user ./CloudRedirect-linux-x86_64.flatpak`).
 
+If you keep SLSsteam and the pinned Steam client up to date with the [headcrab](https://github.com/Deadboy666/h3adcr-b) script, use this fork's wrapper instead of the "Headcrab Updater" menu entry: it runs headcrab with its CloudRedirect downloads pointed at this fork (the unpatched script overwrites the deployed `cloud_redirect.so` with upstream's build every run), then redeploys the Flatpak's library and installs itself as "CloudRedirect (fork) Updater" in the application menu:
+
+```
+curl -fsSL https://raw.githubusercontent.com/Anniversor/CloudRedirect/master/linux/deck-update.sh | bash
+```
+
+`cr-deck-update.sh --skip-headcrab` only switches the remote, updates the Flatpak and redeploys the library.
+
 Open the CloudRedirect app, sign into a provider.
 
 Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 
