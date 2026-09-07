@@ -1787,10 +1787,10 @@ static bool __fastcall ServiceMethodDirectHook(void* thisptr, const char* method
         return result;
     }
 
-    // Player.GetUserStats#1 (slot 4, raw bodies). Third-party uses raw schemaFetch flag.
+    // Player.GetUserStats#1 (slot 4, raw bodies). Third-party uses the answer_user_stats flag (fork).
     if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
         && (g_cloudSaveOnly.load(std::memory_order_relaxed)
-            ? MetadataSync::schemaFetch.load(std::memory_order_relaxed)
+            ? MetadataSync::answerUserStats.load(std::memory_order_relaxed)
             : MetadataSync::SchemaFetchEnabled())) {
         if (requestBody && responseBody && g_serializeToArray) {
             auto reqBytes = SerializeBodyToBytes(requestBody);
@@ -1996,7 +1996,7 @@ static bool __fastcall ServiceMethodHook(void* thisptr, const char* methodName,
     // Player.GetUserStats#1: answer namespace apps from our store for the achievement page.
     if (strcmp(methodName, StatsHandlers::RPC_GET_USER_STATS) == 0
         && (g_cloudSaveOnly.load(std::memory_order_relaxed)
-            ? MetadataSync::schemaFetch.load(std::memory_order_relaxed)
+            ? MetadataSync::answerUserStats.load(std::memory_order_relaxed)
             : MetadataSync::SchemaFetchEnabled())) {
         if (request && response) {
             void* reqBody = *(void**)((uintptr_t)request + 48);
@@ -4677,10 +4677,14 @@ void Init(const std::string& steamPath, bool cloudSaveOnly, CR_NotifyFn notifyCa
             MetadataSync::syncAchievements = cfg["sync_achievements"].boolean();
         if (cfg["sync_playtime"].type == Json::Type::Bool)
             MetadataSync::syncPlaytime = cfg["sync_playtime"].boolean();
+        // Fork: answer the achievements page from our store (default on).
+        if (cfg["answer_user_stats"].type == Json::Type::Bool)
+            MetadataSync::answerUserStats = cfg["answer_user_stats"].boolean();
         // schema_fetch is retired and no longer honored; it stays off regardless of config.
-        LOG("[Stats] Sync gates: achievements=%d, playtime=%d, steamTools=%d, stGateOpen=%d",
+        LOG("[Stats] Sync gates: achievements=%d, playtime=%d, answerUserStats=%d, steamTools=%d, stGateOpen=%d",
             MetadataSync::syncAchievements.load() ? 1 : 0,
             MetadataSync::syncPlaytime.load() ? 1 : 0,
+            MetadataSync::answerUserStats.load() ? 1 : 0,
             MetadataSync::steamToolsPresent.load() ? 1 : 0,
             MetadataSync::StGateOpen() ? 1 : 0);
         // Defaults to true when absent.

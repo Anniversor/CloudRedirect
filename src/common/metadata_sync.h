@@ -14,6 +14,12 @@ extern std::atomic<bool> syncPlaytime;
 // Retired schema-fetch flag. SchemaFetchEnabled() always returns false now.
 extern std::atomic<bool> schemaFetch;
 
+// Fork: answer Player.GetUserStats#1 for namespace apps from our own store so the
+// Steam achievements page shows cloud-synced unlocks (config: answer_user_stats,
+// default on). Independent of the retired schema fetch: when we hold no schema
+// the request is passed through so the unlock client / Steam can fetch it.
+extern std::atomic<bool> answerUserStats;
+
 inline bool IsEnabled() {
     return steamToolsPresent.load(std::memory_order_relaxed) &&
            syncLuas.load(std::memory_order_relaxed);

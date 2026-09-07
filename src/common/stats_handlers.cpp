@@ -46,6 +46,17 @@ CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<P
     // Snapshot: thread-safe copy taken under the store lock.
     StatsStore::AppStats stats = StatsStore::Snapshot(appId);
 
+    if (stats.schema.empty()) {
+        // Without a schema the client discards any stats we send, and answering
+        // at all (even crc-only) hides the request from the unlock client, which
+        // fetches the schema from Steam on the client's behalf (OST spoofs the
+        // request when the client has none). Pass through instead; the native
+        // import adopts the schema once it lands in appcache/stats, and from then
+        // on we answer with our own unlocks.
+        LOG("[Stats] GetUserStats app=%u: no schema in store, passing through", appId);
+        return CloudIntercept::RpcResult();
+    }
+
     PB::Writer resp;
 
     // Client adopts stats only when our crc differs from its echoed crc.
@@ -59,16 +70,9 @@ CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<P
         return CloudIntercept::RpcResult(std::move(resp));
     }
 
-    // Client stale -- send schema + stats. Schema required or client discards.
-    if (!stats.schema.empty()) {
-        resp.WriteBytes(3, stats.schema.data(), stats.schema.size());
-        LOG("[Stats]   Sending schema (%zu bytes)", stats.schema.size());
-    } else if (!stats.stats.empty()) {
-        // Stats without schema -> client rejects. Send crc-only to be safe.
-        LOG("[Stats]   app=%u WARNING: have %zu stats but no schema; sending crc-only to avoid client-side discard",
-            appId, stats.stats.size());
-        return CloudIntercept::RpcResult(std::move(resp));
-    }
+    // Client stale -- send schema + stats (schema presence was checked above).
+    resp.WriteBytes(3, stats.schema.data(), stats.schema.size());
+    LOG("[Stats]   Sending schema (%zu bytes)", stats.schema.size());
 
     // Field 4: stats (repeated)
     for (auto& s : stats.stats) {
