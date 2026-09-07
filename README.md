@@ -62,9 +62,11 @@ That installs upstream's Flatpak. To get this fork's builds (and its updates) in
 
 ```
 flatpak remote-delete --user --force cloudredirect
-flatpak remote-add --user cloudredirect https://anniversor.github.io/CloudRedirect/cloudredirect.flatpakrepo
+flatpak remote-add --user --no-gpg-verify cloudredirect https://anniversor.github.io/CloudRedirect/repo
 flatpak update --user -y org.cloudredirect.CloudRedirect
 ```
+
+(`--no-gpg-verify` because the fork's repo is only GPG-signed when the `FLATPAK_GPG_PRIVATE_KEY` secret is configured in CI; with a signed repo you can add `https://anniversor.github.io/CloudRedirect/cloudredirect.flatpakrepo` instead and the app will offer to manage updates itself.)
 
 Then open the app, press Update on the dashboard so the bundled `cloud_redirect.so` is deployed, and restart Steam. Every release also carries `CloudRedirect-linux-x86_64.flatpak` for offline installs (`flatpak install --user ./CloudRedirect-linux-x86_64.flatpak`).
 
