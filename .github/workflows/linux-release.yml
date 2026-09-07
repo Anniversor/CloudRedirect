@@ -175,6 +175,9 @@ jobs:
           if [ "$code" = "200" ]; then
             tar -xzf gh-pages.tar.gz --strip-components=1 -C site
             rm -f gh-pages.tar.gz site/repo/.lock
+            # git keeps no empty directories, so restore the OSTree repo layout
+            # (ostree aborts on a missing refs/remotes when generating deltas).
+            mkdir -p site/repo/objects site/repo/refs/heads site/repo/refs/mirrors site/repo/refs/remotes site/repo/state site/repo/tmp
             echo "Restored the published repo ($(find site/repo/objects -type f 2>/dev/null | wc -l) objects)"
           else
             echo "No gh-pages branch yet (HTTP $code): starting a fresh repo"
