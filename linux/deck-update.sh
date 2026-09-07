@@ -77,6 +77,9 @@ ensure_remote() {
         log "adding the fork's Flatpak remote as '$REMOTE_NAME'"
     fi
     flatpak remote-add --user "$REMOTE_NAME" "$FORK_FLATPAKREPO" || die "could not add the fork's remote"
+    # The app's own update check reads the remote's appstream data
+    # ('flatpak remote-info' Version), which a fresh remote does not have yet.
+    flatpak update --user --appstream "$REMOTE_NAME" >/dev/null 2>&1 || warn "could not refresh appstream data for '$REMOTE_NAME'"
 }
 
 update_flatpak() {
