@@ -7,10 +7,13 @@
 #      (https://anniversor.github.io/CloudRedirect) if it is not there yet;
 #   2. updates (or installs) the CloudRedirect Flatpak from it;
 #   3. unless --skip-headcrab: runs the headcrab updater (SLSsteam + pinned Steam
-#      client, https://github.com/Deadboy666/h3adcr-b) with its three
-#      CloudRedirect sources rewritten to the fork, because the unpatched script
-#      overwrites ~/.local/share/CloudRedirect/cloud_redirect.so with upstream's
-#      build on every run;
+#      client, https://github.com/Deadboy666/h3adcr-b) behind wget/curl/flatpak
+#      shims that send any download of cloud_redirect.so, cloud_redirect_cli or
+#      cloudredirect.flatpakrepo to the fork instead. The shims key on those
+#      file names, not on how the script spells its variables or where upstream
+#      hosts the files, so they survive script rewrites; without them the
+#      script overwrites ~/.local/share/CloudRedirect/cloud_redirect.so with
+#      upstream's build on every run;
 #   4. copies the Flatpak's bundled cloud_redirect.so and cloud_redirect_cli into
 #      ~/.local/share/CloudRedirect (exactly what the app's Update button does),
 #      so Steam loads the fork's library on its next start;
@@ -95,27 +98,59 @@ update_flatpak() {
     log "installed: $(printf '%s\n' "$info" | awk -F': *' '/^ *Version:/{print $2}') from $(printf '%s\n' "$info" | awk -F': *' '/^ *Origin:/{print $2}')"
 }
 
+# Shims for the downloaders headcrab uses. A URL whose last path element is one
+# of our three artifact names is swapped for the fork's copy; everything else
+# passes through untouched. Only the artifact names matter, so this keeps
+# working when upstream renames variables, moves repositories or restructures
+# the script. Each swap is logged to $SHIM_LOG for the summary.
+make_download_shims() {
+    SHIM_DIR=$(mktemp -d) || die "mktemp failed"
+    SHIM_LOG="$SHIM_DIR/redirected.log"
+    : > "$SHIM_LOG"
+    local tool real
+    for tool in wget curl flatpak; do
+        real=$(command -v "$tool") || continue
+        cat > "$SHIM_DIR/$tool" <<SHIM
+#!/usr/bin/env bash
+# cr-deck-update shim around $real: CloudRedirect artifacts come from the fork.
+args=()
+for a in "\$@"; do
+    case "\$a" in
+        http://*/cloud_redirect.so|https://*/cloud_redirect.so)
+            printf 'cloud_redirect.so <- %s\n' "\$a" >> "$SHIM_LOG"
+            a="$FORK_RELEASES/cloud_redirect.so" ;;
+        http://*/cloud_redirect_cli|https://*/cloud_redirect_cli)
+            printf 'cloud_redirect_cli <- %s\n' "\$a" >> "$SHIM_LOG"
+            a="$FORK_RELEASES/cloud_redirect_cli" ;;
+        http://*/cloudredirect.flatpakrepo|https://*/cloudredirect.flatpakrepo)
+            printf 'cloudredirect.flatpakrepo <- %s\n' "\$a" >> "$SHIM_LOG"
+            a="$FORK_FLATPAKREPO" ;;
+    esac
+    args+=("\$a")
+done
+exec "$real" "\${args[@]}"
+SHIM
+        chmod 755 "$SHIM_DIR/$tool"
+    done
+}
+
 run_headcrab() {
-    local script patched rc
+    local script rc
     script=$(mktemp) || die "mktemp failed"
     curl -fsSL "$HEADCRAB_URL" -o "$script" || { rm -f "$script"; die "could not download the headcrab script"; }
-    # Rewrite headcrab's three CloudRedirect sources to the fork. If upstream
-    # renames the variables the script just runs unpatched, and
-    # redeploy_from_flatpak puts the fork's library back afterwards anyway.
-    sed -i \
-        -e "s|^\([[:space:]]*CloudRedirectLib=\).*|\1\"$FORK_RELEASES/cloud_redirect.so\"|" \
-        -e "s|^\([[:space:]]*CloudRedirectCLI=\).*|\1\"$FORK_RELEASES/cloud_redirect_cli\"|" \
-        -e "s|^\([[:space:]]*cloudredirect=\).*|\1\"$FORK_FLATPAKREPO\"|" \
-        "$script"
-    patched=$(grep -c 'Anniversor' "$script")
-    if [ "$patched" -lt 3 ]; then
-        warn "only $patched of 3 headcrab CloudRedirect URLs could be rewritten (did upstream change the script?)"
-    fi
-    log "running headcrab (SLSsteam / Steam client updater) with CloudRedirect sources pointed at the fork"
-    bash "$script"
+    make_download_shims
+    log "running headcrab (SLSsteam / Steam client updater); its CloudRedirect downloads are redirected to the fork"
+    PATH="$SHIM_DIR:$PATH" bash "$script"
     rc=$?
     rm -f "$script"
     [ "$rc" -eq 0 ] || warn "headcrab exited with status $rc"
+    if [ -s "$SHIM_LOG" ]; then
+        log "downloads redirected to the fork:"
+        sed 's/^/    /' "$SHIM_LOG"
+    else
+        log "headcrab downloaded no CloudRedirect artifacts this run"
+    fi
+    rm -rf "$SHIM_DIR"
 }
 
 redeploy_from_flatpak() {
