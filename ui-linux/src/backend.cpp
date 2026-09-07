@@ -1982,7 +1982,7 @@ void Backend::enableAutoUpdates()
 
     // Use the hosted .flatpakrepo URL; the local file is inside the sandbox
     // and inaccessible to the host flatpak process via flatpak-spawn.
-    QString repoUrl = "https://selectively11.github.io/CloudRedirect/cloudredirect.flatpakrepo";
+    QString repoUrl = "https://anniversor.github.io/CloudRedirect/cloudredirect.flatpakrepo";
 
     QProcess proc;
     proc.start("flatpak-spawn", {"--host", "flatpak", "remote-add", "--user", "--if-not-exists", "cloudredirect", repoUrl});
@@ -2061,19 +2061,19 @@ void Backend::checkForFlatpakUpdate()
     // Compare versions: only notify if remote is strictly newer
     QString current = QCoreApplication::applicationVersion();
     auto parseVer = [](const QString &v) -> QList<int> {
-        // Strip prerelease suffix (e.g. "-TEST4") for comparison
-        QString base = v.section('-', 0, 0);
+        // Strip the build id ("+1a2b3c4") and any prerelease suffix ("-TEST4").
+        // Fork releases carry a fourth component (2.6.5.4 is newer than 2.6.5).
+        QString base = v.section('+', 0, 0).section('-', 0, 0);
         QList<int> parts;
         for (const QString &p : base.split('.'))
             parts.append(p.toInt());
-        while (parts.size() < 3) parts.append(0);
+        while (parts.size() < 4) parts.append(0);
         return parts;
     };
-
     QList<int> rv = parseVer(remoteVersion);
     QList<int> cv = parseVer(current);
     bool remoteNewer = false;
-    for (int i = 0; i < 3; ++i) {
+    for (int i = 0; i < 4; ++i) {
         if (rv[i] > cv[i]) { remoteNewer = true; break; }
         if (rv[i] < cv[i]) break;
     }

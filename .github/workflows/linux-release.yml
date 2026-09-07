@@ -1,0 +1,267 @@
+name: Linux build and release
+
+# Builds the 32-bit cloud_redirect.so / cloud_redirect_cli that hook Steam on
+# Linux (Steam is 32-bit; built against glibc 2.31 like upstream), packs them
+# with the Qt UI into the Flatpak, and for vX.Y.Z[.N] tags publishes a
+# GPG-signed Flatpak repo to GitHub Pages (the update channel the Linux app and
+# the Steam Deck use) plus the bundle and the raw binaries on the GitHub release.
+#
+# Signing needs the FLATPAK_GPG_PRIVATE_KEY repository secret (armored private
+# key, no passphrase). Without it the Flatpak is still built and attached to the
+# release as an unsigned bundle, but the repo is not published: the Linux app
+# refuses update remotes without a GPG key, so an unsigned repo is useless.
+
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  APP_ID: org.cloudredirect.CloudRedirect
+  PAGES_URL: https://anniversor.github.io/CloudRedirect
+
+jobs:
+  native:
+    name: Native 32-bit (Ubuntu 20.04, glibc 2.31)
+    runs-on: ubuntu-latest
+    container: ubuntu:20.04
+    steps:
+      - name: Install the toolchain (GCC 12 multilib from the toolchain PPA, CMake from pip)
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          set -e
+          apt-get update
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make python3-pip
+          add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          apt-get update
+          apt-get install -y --no-install-recommends gcc-12 g++-12 gcc-12-multilib g++-12-multilib
+          pip3 install --no-cache-dir 'cmake>=3.20'
+          cmake --version | head -1
+          gcc-12 --version | head -1
+
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set release version from tag (not committed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          tag='${{ github.ref_name }}'
+          if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            echo "Tag '$tag' must look like vX.Y.Z (upstream version) or vX.Y.Z.N (fork revision)"; exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          sed -i "s|<ReleaseVersion>[^<]*</ReleaseVersion>|<ReleaseVersion>$version</ReleaseVersion>|" Version.props
+          echo "ReleaseVersion set to $version"
+
+      - name: Build 32-bit cloud_redirect.so and cloud_redirect_cli
+        run: |
+          set -e
+          sha=$(echo '${{ github.sha }}' | cut -c1-7)
+          cmake -S . -B build-linux32 -DCMAKE_BUILD_TYPE=Release -DLINUX_32BIT=ON \
+            -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 "-DCR_GIT_SHA=$sha"
+          cmake --build build-linux32 --target cloud_redirect cloud_redirect_cli -j"$(nproc)"
+
+      - name: Verify the binaries are 32-bit and report their glibc requirement
+        run: |
+          set -e
+          for f in build-linux32/cloud_redirect.so build-linux32/cloud_redirect_cli; do
+            file "$f"
+            file "$f" | grep -q 'ELF 32-bit' || { echo "$f is not a 32-bit ELF"; exit 1; }
+            echo "$f: newest glibc symbol version $(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+          done
+
+      - name: Build and run fork unit tests (64-bit host build of the shared code)
+        run: |
+          set -e
+          sha=$(echo '${{ github.sha }}' | cut -c1-7)
+          cmake -S . -B build-linux64 -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=gcc-12 -DCMAKE_CXX_COMPILER=g++-12 "-DCR_GIT_SHA=$sha"
+          cmake --build build-linux64 --target stats_store_fork_tests -j"$(nproc)"
+          ./build-linux64/stats_store_fork_tests
+
+      - name: Upload native binaries
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-native
+          path: |
+            build-linux32/cloud_redirect.so
+            build-linux32/cloud_redirect_cli
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak (KDE Platform 6.10)
+    needs: native
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.10
+      options: --privileged
+    outputs:
+      signed: ${{ steps.gpg.outputs.keyid != '' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set release version from tag (not committed)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -e
+          tag='${{ github.ref_name }}'
+          if ! [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?)$ ]]; then
+            echo "Tag '$tag' must look like vX.Y.Z (upstream version) or vX.Y.Z.N (fork revision)"; exit 1
+          fi
+          version="${BASH_REMATCH[1]}"
+          sed -i "s|<ReleaseVersion>[^<]*</ReleaseVersion>|<ReleaseVersion>$version</ReleaseVersion>|" Version.props
+          # The version 'flatpak remote-info' reports (what the app's update check
+          # compares against) is the newest <release> in the metainfo.
+          date=$(date -u +%Y-%m-%d)
+          sed -i "0,/<releases>/s|<releases>|<releases>\n    <release version=\"$version\" date=\"$date\" />|" \
+            flatpak/org.cloudredirect.CloudRedirect.metainfo.xml
+          grep -m1 '<release ' flatpak/org.cloudredirect.CloudRedirect.metainfo.xml
+
+      - name: Download native binaries
+        uses: actions/download-artifact@v5
+        with:
+          name: linux-native
+          path: flatpak
+
+      - name: Import the Flatpak signing key
+        id: gpg
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          set -e
+          if [ -z "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+            echo "::warning::FLATPAK_GPG_PRIVATE_KEY is not set: building an unsigned bundle, the Flatpak repo will not be published"
+            echo "keyid=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          keyid=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1=="fpr"{print $10; exit}')
+          [ -n "$keyid" ] || { echo "The secret did not contain a usable secret key"; exit 1; }
+          echo "Signing with key $keyid"
+          echo "keyid=$keyid" >> "$GITHUB_OUTPUT"
+          # The descriptor shipped inside the Flatpak (the app reads it to offer
+          # auto-updates) and the one served from Pages both carry this key.
+          pub=$(gpg --batch --export "$keyid" | base64 -w0)
+          grep -q '^GPGKey=' flatpak/cloudredirect.flatpakrepo && sed -i '/^GPGKey=/d' flatpak/cloudredirect.flatpakrepo
+          printf 'GPGKey=%s\n' "$pub" >> flatpak/cloudredirect.flatpakrepo
+
+      - name: Restore the published repo so OSTree history and deltas carry over
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          mkdir -p site
+          code=$(curl -sS -L -o gh-pages.tar.gz -w '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/${{ github.repository }}/tarball/gh-pages" || true)
+          if [ "$code" = "200" ]; then
+            tar -xzf gh-pages.tar.gz --strip-components=1 -C site
+            rm -f gh-pages.tar.gz site/repo/.lock
+            echo "Restored the published repo ($(find site/repo/objects -type f 2>/dev/null | wc -l) objects)"
+          else
+            echo "No gh-pages branch yet (HTTP $code): starting a fresh repo"
+            rm -f gh-pages.tar.gz
+          fi
+
+      - name: Build the Flatpak
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: flatpak/org.cloudredirect.CloudRedirect.yml
+          bundle: CloudRedirect-linux-x86_64.flatpak
+          repo-dir: site/repo
+          branch: master
+          gpg-sign: ${{ steps.gpg.outputs.keyid }}
+          cache-key: flatpak-builder-${{ github.sha }}
+          upload-artifact: false
+
+      - name: Sign the repo summary and generate static deltas
+        if: steps.gpg.outputs.keyid != ''
+        run: |
+          set -e
+          flatpak build-update-repo --gpg-sign='${{ steps.gpg.outputs.keyid }}' \
+            --generate-static-deltas --prune --prune-depth=4 site/repo
+          cp flatpak/cloudredirect.flatpakrepo site/cloudredirect.flatpakrepo
+          cp flatpak/cloud_redirect_icon.svg site/repo/icon.svg
+          cp flatpak/icons/256x256/apps/cloudredirect.png site/repo/icon.png
+          touch site/.nojekyll
+          rm -f site/repo/.lock
+          du -sh site/repo
+          ostree --repo=site/repo refs || true
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-flatpak
+          path: CloudRedirect-linux-x86_64.flatpak
+          if-no-files-found: error
+
+      - name: Upload the Pages site
+        if: steps.gpg.outputs.keyid != ''
+        uses: actions/upload-artifact@v5
+        with:
+          name: linux-pages-site
+          path: site
+          include-hidden-files: true
+          if-no-files-found: error
+
+  publish:
+    name: Publish repo and release assets
+    needs: flatpak
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build outputs
+        uses: actions/download-artifact@v5
+        with:
+          path: out
+
+      - name: Publish the Flatpak repo to GitHub Pages
+        if: needs.flatpak.outputs.signed == 'true'
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: out/linux-pages-site
+          publish_branch: gh-pages
+          force_orphan: true
+          commit_message: 'Publish signed Flatpak repo for ${{ github.ref_name }}'
+
+      - name: Collect release assets with bare sha256 files
+        run: |
+          set -e
+          mkdir -p dist
+          cp out/linux-flatpak/CloudRedirect-linux-x86_64.flatpak dist/
+          cp out/linux-native/cloud_redirect.so out/linux-native/cloud_redirect_cli dist/
+          cd dist
+          for f in *; do sha256sum "$f" | cut -d' ' -f1 | tr -d '\n' > "$f.sha256"; done
+          ls -l
+
+      - name: Attach the Linux assets to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          tag='${{ github.ref_name }}'
+          # The Windows workflow creates the release for the same tag; wait for it
+          # instead of racing it (it takes a few minutes longer than nothing).
+          for i in $(seq 1 60); do
+            gh release view "$tag" --repo '${{ github.repository }}' >/dev/null 2>&1 && break
+            [ "$i" -lt 60 ] || { echo "Release $tag did not appear after 20 minutes; the assets are still available as workflow artifacts"; exit 1; }
+            sleep 20
+          done
+          gh release upload "$tag" dist/* --repo '${{ github.repository }}' --clobber
+          gh release view "$tag" --repo '${{ github.repository }}' --json assets --jq '.assets[].name'

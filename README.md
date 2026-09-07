@@ -58,6 +58,16 @@ Edit your SLSsteam config, set DisableCloud to No.
 
 ```curl -fsSL headcrab.pages.dev | bash```
 
+That installs upstream's Flatpak. To get this fork's builds (and its updates) instead, point the `cloudredirect` remote at this fork's repo once, in a terminal on the device:
+
+```
+flatpak remote-delete --user --force cloudredirect
+flatpak remote-add --user cloudredirect https://anniversor.github.io/CloudRedirect/cloudredirect.flatpakrepo
+flatpak update --user -y org.cloudredirect.CloudRedirect
+```
+
+Then open the app, press Update on the dashboard so the bundled `cloud_redirect.so` is deployed, and restart Steam. Every release also carries `CloudRedirect-linux-x86_64.flatpak` for offline installs (`flatpak install --user ./CloudRedirect-linux-x86_64.flatpak`).
+
 Open the CloudRedirect app, sign into a provider.
 
 Edit your SLS config. The games you want to sync must be specified under AdditionalApps in your SLS config. This requirement will go away in the future. 

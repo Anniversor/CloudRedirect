@@ -14,46 +14,59 @@
 #define ELFCLASS32 1
 #define ELFCLASS64 2
 
+// The .so embeds its version as "X.Y.Z+<7 hex git sha>" (fork builds:
+// "X.Y.Z.N+<sha>"), optionally followed by "-dirty", or "X.Y.Z+unknown" when
+// built outside git. Components may have any number of digits.
 static QString getSoVersion(const QString &path)
 {
     QFile f(path);
     if (!f.open(QIODevice::ReadOnly))
         return QString();
-
     QByteArray data = f.readAll();
     f.close();
 
-    const char* p = data.constData();
-    const char* end = p + data.size() - 20;
-    
-    for (; p < end; ++p) {
-        if (p[0] >= '0' && p[0] <= '9' &&
-            p[1] == '.' &&
-            p[2] >= '0' && p[2] <= '9' &&
-            p[3] == '.' &&
-            p[4] >= '0' && p[4] <= '9' &&
-            p[5] == '+') {
-            const char* start = p;
-            const char* q = p + 6;
-            int hexCount = 0;
-            while (q < data.constData() + data.size() && 
-                   ((*q >= '0' && *q <= '9') || (*q >= 'a' && *q <= 'f'))) {
-                ++hexCount;
-                ++q;
-            }
-            if (hexCount == 7) {
-                if (q + 6 <= data.constData() + data.size() && 
-                    strncmp(q, "-dirty", 6) == 0) {
-                    q += 6;
-                }
-                return QString::fromLatin1(start, q - start);
-            }
-            if (strncmp(p + 6, "unknown", 7) == 0) {
-                return QString::fromLatin1(start, 13);
-            }
-        }
-    }
+    const char* base = data.constData();
+    const int n = data.size();
+    auto isDigit = [](char c) { return c >= '0' && c <= '9'; };
+    auto isHex = [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); };
 
+    for (int plus = 0; plus < n; ++plus) {
+        if (base[plus] != '+')
+            continue;
+        // Walk back over the dotted numeric version in front of the '+'.
+        int start = plus;
+        while (start > 0 && (isDigit(base[start - 1]) || base[start - 1] == '.'))
+            --start;
+        while (start < plus && base[start] == '.')
+            ++start;
+        bool valid = start < plus && isDigit(base[start]) && isDigit(base[plus - 1]);
+        int dots = 0;
+        for (int k = start; valid && k < plus; ++k) {
+            if (base[k] != '.')
+                continue;
+            ++dots;
+            if (base[k + 1] == '.')
+                valid = false;
+        }
+        if (!valid || dots < 2 || dots > 3)
+            continue;
+        // The build id after the '+': 7 hex digits (optionally "-dirty") or "unknown".
+        int end = plus + 1;
+        if (n - end >= 7 && strncmp(base + end, "unknown", 7) == 0) {
+            end += 7;
+        } else {
+            int hex = 0;
+            while (end < n && isHex(base[end])) {
+                ++hex;
+                ++end;
+            }
+            if (hex != 7)
+                continue;
+            if (n - end >= 6 && strncmp(base + end, "-dirty", 6) == 0)
+                end += 6;
+        }
+        return QString::fromLatin1(base + start, end - start);
+    }
     return QString();
 }
 
