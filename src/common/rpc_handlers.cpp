@@ -746,7 +746,7 @@ RpcResult HandleGetChangelist(uint32_t appId, const std::vector<PB::Field>& reqB
             "returning empty authoritative (native advances local CN to match)",
             appId, cloudCN);
     } else if (haveCloudManifest && !cloudManifest.empty() && interruptedUpload &&
-               cloudCN <= guardLocalCN) {
+               cloudCN <= guardLocalCN && clientChangeNumber >= cloudCN) {
         SetRpcCrashContext("GetChangelist:interrupted-upload", "Cloud.GetAppFileChangelist#1", appId);
         serverChangeNumber = clientChangeNumber > cloudCN ? clientChangeNumber : cloudCN;
         responseIsDelta = true;
@@ -1319,8 +1319,8 @@ RpcResult HandleLaunchIntent(uint32_t appId, const std::vector<PB::Field>& reqBo
         }
     }
 
-    // Don't clear UploadPending here: RecordLaunchIntent already scopes it, and
-    // this runs before GetAppFileChangelist needs the marker.
+    // Don't clear UploadPending here: this runs before GetAppFileChangelist reads the
+    // marker. RecordLaunchIntent re-persists it and honours ignorePendingOperations.
     auto pending = PendingOpsJournal::RecordLaunchIntent(
         accountId, appId, currentSession, ignorePendingOperations);
 
@@ -2181,9 +2181,12 @@ RpcResult HandleCompleteBatch(uint32_t appId, const std::vector<PB::Field>& reqB
         }
 
         if (!publishSucceeded) {
-            PendingOpsJournal::RecordUploadBatchEnd(accountId, appId);
-            LOG("[NS] CompleteBatch(pub): all publish attempts exhausted for app %u",
-                appId);
+            // Nothing reached the cloud: downgrade to UploadPending, not clear.
+            // RecordUploadBatchEnd here would drop the marker and let stale cloud
+            // state overwrite unpublished saves.
+            PendingOpsJournal::RecordUploadBatchInterrupted(accountId, appId);
+            LOG("[NS] CompleteBatch(pub): all publish attempts exhausted for app %u "
+                "-- upload left pending", appId);
         }
         // Resolve the barrier BEFORE GC — session release must not wait on housekeeping.
         publishPromise.set_value();

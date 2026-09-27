@@ -139,6 +139,24 @@ void TestInterruptedBatchRecoveryCycle() {
     CHECK(!PJ::HasInterruptedUpload(kAccount, appId));
 }
 
+// A failed publish must downgrade to UploadPending, not clear the marker.
+void TestFailedPublishKeepsMarker() {
+    const uint32_t appId = 8;
+    BeginSession(appId);
+    PJ::RecordUploadBatchStart(kAccount, appId);
+
+    // All publish attempts exhausted.
+    PJ::RecordUploadBatchInterrupted(kAccount, appId);
+
+    CHECK(PJ::HasInterruptedUpload(kAccount, appId));
+    CHECK(HasOp(appId, PJ::Operation::UploadPending));
+    CHECK(!HasOp(appId, PJ::Operation::UploadInProgress));
+
+    // Marker must still survive the next launch so the changelist guard sees it.
+    PJ::RecordLaunchIntent(kAccount, appId, MakeSession(777), false);
+    CHECK(PJ::HasInterruptedUpload(kAccount, appId));
+}
+
 } // namespace
 
 int main() {
@@ -155,6 +173,7 @@ int main() {
     TestLaunchIntentDropsMarkerWhenIgnoring();
     TestBatchEndClearsPending();
     TestInterruptedBatchRecoveryCycle();
+    TestFailedPublishKeepsMarker();
 
     std::filesystem::remove_all(root, ec);
 

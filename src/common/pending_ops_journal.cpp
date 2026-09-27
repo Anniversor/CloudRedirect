@@ -264,8 +264,8 @@ void RecordUploadBatchEnd(uint32_t accountId, uint32_t appId) {
     std::lock_guard<std::mutex> lock(g_mutex);
     std::optional<Entry> currentSession;
     auto entries = LoadEntriesUnlocked(accountId, appId, &currentSession);
-    // Clear UploadPending too: a committed batch is the resolution point. Leaving it
-    // would pin HasInterruptedUpload true forever and strand the app on empty deltas.
+    // Success path only; use RecordUploadBatchInterrupted when the publish failed.
+    // Clears both ops: leaving them pins HasInterruptedUpload true forever.
     RemoveUploadOperations(entries);
     SaveStateUnlocked(accountId, appId, entries, currentSession);
 }
