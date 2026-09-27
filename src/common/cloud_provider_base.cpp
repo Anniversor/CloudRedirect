@@ -256,6 +256,11 @@ HttpResp CloudProviderBase::ApiRequest(const char* method, const std::string& pa
         if (!contentType.empty())
             hdrs.push_back("Content-Type: " + contentType);
         lastResp = Request(method, ApiHost(), path, body, hdrs);
+        // A rejected TLS handshake or untrusted certificate fails identically on every attempt.
+        if (lastResp.tlsFailure) {
+            LOG("%s TLS failure for %s %s, not retrying", LogTag(), method, path.c_str());
+            return lastResp;
+        }
         bool rateLimited = IsRateLimited(lastResp.status, lastResp.body);
         bool timedOut = (lastResp.status == 0);
         if (!rateLimited && !timedOut) return lastResp;

@@ -225,6 +225,9 @@ HttpUtil::HttpResp S3Provider::SignedRequest(
 
         resp = m_transport->RequestUrl(method, url, body, headers);
 
+        // TLS/cert failures fail identically every attempt; don't retry.
+        if (resp.tlsFailure) return resp;
+
         bool shouldRetry = (resp.status == 429 || resp.status == 500 ||
                              resp.status == 502 || resp.status == 503 ||
                              resp.status == 0);

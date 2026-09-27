@@ -230,6 +230,27 @@ static void ParseHeaders(const std::string& raw, std::map<std::string, std::stri
     }
 }
 
+// TLS handshake, cipher and certificate-trust failures. These reflect a bad
+// endpoint, clock, or CA configuration rather than a transient network fault,
+// so retrying them only burns the caller's time budget.
+static bool IsCurlTlsFailure(int res) {
+    switch (res) {
+        case 35:  // CURLE_SSL_CONNECT_ERROR
+        case 58:  // CURLE_SSL_CERTPROBLEM
+        case 59:  // CURLE_SSL_CIPHER
+        case 60:  // CURLE_PEER_FAILED_VERIFICATION
+        case 64:  // CURLE_USE_SSL_FAILED
+        case 66:  // CURLE_SSL_ENGINE_INITFAILED
+        case 77:  // CURLE_SSL_CACERT_BADFILE
+        case 83:  // CURLE_SSL_ISSUER_ERROR
+        case 90:  // CURLE_SSL_PINNEDPUBKEYNOTMATCH
+        case 91:  // CURLE_SSL_INVALIDCERTSTATUS
+            return true;
+        default:
+            return false;
+    }
+}
+
 static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
                                        const std::string& url, const std::string& body,
                                        const std::vector<std::string>& hdrs,
@@ -326,6 +347,7 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
     }
 
     if (res != 0) {
+        resp.tlsFailure = IsCurlTlsFailure(res);
         LOG("%s curl failed: %d (%s %s)", logTag, res, method, url.c_str());
         return resp;
     }

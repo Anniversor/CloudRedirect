@@ -15,6 +15,24 @@
 using HttpUtil::Widen;
 using HttpUtil::HttpResp;
 
+// TLS/cert failures: a config fault (endpoint, clock, CA), not a transient one.
+static bool IsWinHttpTlsFailure(DWORD err) {
+    switch (err) {
+        case ERROR_WINHTTP_SECURE_FAILURE:
+        case ERROR_WINHTTP_SECURE_CHANNEL_ERROR:
+        case ERROR_WINHTTP_SECURE_INVALID_CA:
+        case ERROR_WINHTTP_SECURE_INVALID_CERT:
+        case ERROR_WINHTTP_SECURE_CERT_CN_INVALID:
+        case ERROR_WINHTTP_SECURE_CERT_DATE_INVALID:
+        case ERROR_WINHTTP_SECURE_CERT_REVOKED:
+        case ERROR_WINHTTP_SECURE_CERT_REV_FAILED:
+        case ERROR_WINHTTP_SECURE_CERT_WRONG_USAGE:
+            return true;
+        default:
+            return false;
+    }
+}
+
 class WinHttpTransport : public IHttpTransport {
 public:
     explicit WinHttpTransport(const char* logTag) : m_logTag(logTag) {}
@@ -81,9 +99,18 @@ public:
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
-        if (!ok) LOG("%s WinHttpSendRequest failed: error %lu", m_logTag, GetLastError());
-        if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
-        if (!ok) LOG("%s WinHttpReceiveResponse failed: error %lu", m_logTag, GetLastError());
+        if (!ok) {
+            DWORD err = GetLastError();
+            resp.tlsFailure = IsWinHttpTlsFailure(err);
+            LOG("%s WinHttpSendRequest failed: error %lu", m_logTag, err);
+        } else {
+            ok = WinHttpReceiveResponse(hReq, nullptr);
+            if (!ok) {
+                DWORD err = GetLastError();
+                resp.tlsFailure = IsWinHttpTlsFailure(err);
+                LOG("%s WinHttpReceiveResponse failed: error %lu", m_logTag, err);
+            }
+        }
 
         if (ok) {
             DWORD code = 0, codeLen = sizeof(code);
@@ -161,9 +188,18 @@ public:
         BOOL ok = WinHttpSendRequest(hReq, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             body.empty() ? nullptr : (void*)body.data(), (DWORD)body.size(),
             (DWORD)body.size(), 0);
-        if (!ok) LOG("%s WinHttpSendRequest failed for URL: error %lu", m_logTag, GetLastError());
-        if (ok) ok = WinHttpReceiveResponse(hReq, nullptr);
-        if (!ok) LOG("%s WinHttpReceiveResponse failed for URL: error %lu", m_logTag, GetLastError());
+        if (!ok) {
+            DWORD err = GetLastError();
+            resp.tlsFailure = IsWinHttpTlsFailure(err);
+            LOG("%s WinHttpSendRequest failed for URL: error %lu", m_logTag, err);
+        } else {
+            ok = WinHttpReceiveResponse(hReq, nullptr);
+            if (!ok) {
+                DWORD err = GetLastError();
+                resp.tlsFailure = IsWinHttpTlsFailure(err);
+                LOG("%s WinHttpReceiveResponse failed for URL: error %lu", m_logTag, err);
+            }
+        }
 
         if (ok) {
             DWORD code = 0, codeLen = sizeof(code);
