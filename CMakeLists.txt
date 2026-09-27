@@ -442,6 +442,29 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
     add_test(NAME stats_store_tests COMMAND stats_store_tests)
 endif()
 
+# Individually-guarded tests, so a partial tests/ tree still builds.
+if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
+   AND NOT TARGET pending_ops_journal_tests)
+    add_executable(pending_ops_journal_tests
+        tests/pending_ops_journal_tests.cpp
+        src/common/pending_ops_journal.cpp
+        src/common/json.cpp
+    )
+    target_include_directories(pending_ops_journal_tests PRIVATE src/common)
+    # log.cpp needs this; the dormant block above sets it via add_compile_definitions,
+    # which does not reach targets defined out here.
+    target_compile_definitions(pending_ops_journal_tests PRIVATE
+        CR_RELEASE_VERSION="${CR_RELEASE_VERSION}")
+    if(WIN32)
+        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/win)
+        target_sources(pending_ops_journal_tests PRIVATE src/platform/win/log.cpp src/platform/win/platform_win.cpp)
+    else()
+        target_include_directories(pending_ops_journal_tests PRIVATE src/platform/linux)
+        target_sources(pending_ops_journal_tests PRIVATE src/platform/linux/log.cpp src/platform/linux/platform_linux.cpp)
+    endif()
+    add_test(NAME pending_ops_journal_tests COMMAND pending_ops_journal_tests)
+endif()
+
 # ── UI (Windows only) ───────────────────────────────────────────────────
 
 if(WIN32)
