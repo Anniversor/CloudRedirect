@@ -167,8 +167,6 @@ if(WIN32)
     add_dependencies(cloud_redirect_cli cloud_redirect)
 
     # Standalone Steam Cloud file manager for a single AppID (default 760).
-    # Self-contained: resolves the steam_api64.dll flat exports at runtime, so it
-    # needs no Steamworks SDK headers/libs. steam_api64.dll must sit next to it.
     add_executable(cloud760_tool
         src/platform/win/cloud760_tool.cpp
     )
