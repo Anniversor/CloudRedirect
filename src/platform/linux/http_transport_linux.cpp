@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <dlfcn.h>
+#include <link.h>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -48,6 +49,7 @@ typedef CURLcode (*curl_easy_getinfo_fn)(CURL*, int, ...);
 typedef void (*curl_easy_cleanup_fn)(CURL*);
 typedef struct curl_slist* (*curl_slist_append_fn)(struct curl_slist*, const char*);
 typedef void (*curl_slist_free_all_fn)(struct curl_slist*);
+typedef const char* (*curl_version_fn)(void);
 
 #define CURL_GLOBAL_ALL 3  // CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32
 
@@ -71,6 +73,43 @@ static std::mutex g_curlInitMutex;
 // Guard handle lifecycle (not perform) under mutex.
 static std::mutex g_curlHandleMutex;
 
+// Absolute system paths are tried before bare sonames. Inside the Steam scout
+// runtime a bare dlopen("libcurl.so.4") resolves to the runtime's 2018 copy,
+// linked against GnuTLS 3.6.2, which cannot verify current certificate chains --
+// every request fails with CURLE_PEER_FAILED_VERIFICATION (60).
+static const char* const kCurlCandidates[] = {
+#if defined(__i386__)
+    "/usr/lib32/libcurl.so.4",
+    "/usr/lib/i386-linux-gnu/libcurl.so.4",
+    "/lib/i386-linux-gnu/libcurl.so.4",
+    "/usr/lib32/libcurl-gnutls.so.4",
+    "/usr/lib/i386-linux-gnu/libcurl-gnutls.so.4",
+#elif defined(__x86_64__)
+    "/usr/lib64/libcurl.so.4",
+    "/usr/lib/x86_64-linux-gnu/libcurl.so.4",
+    "/lib/x86_64-linux-gnu/libcurl.so.4",
+    "/usr/lib64/libcurl-gnutls.so.4",
+    "/usr/lib/x86_64-linux-gnu/libcurl-gnutls.so.4",
+#endif
+    "libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4",
+    "libcurl-gnutls.so", "libcurl-nss.so.4",
+};
+
+// Path glibc actually resolved the handle to, for diagnostics.
+// Gate on __USE_GNU, not RTLD_DI_LINKMAP: the latter is an enum constant rather
+// than a macro, so an #ifdef on it is always false and silently kills this.
+static std::string ResolvedLibPath(void* handle) {
+#ifdef __USE_GNU
+    struct link_map* lm = nullptr;
+    if (dlinfo(handle, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name && lm->l_name[0]) {
+        return lm->l_name;
+    }
+#else
+    (void)handle;
+#endif
+    return {};
+}
+
 static bool InitCurl() {
     // Serialize init and call curl_global_init() explicitly here -- libcurl's lazy
     // global init off the first curl_easy_init isn't thread-safe and crashed when
@@ -79,33 +118,43 @@ static bool InitCurl() {
     if (g_curlInitAttempted) return g_curl.handle != nullptr;
     g_curlInitAttempted = true;
 
-    const char* names[] = {
-        "libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4",
-        "libcurl-gnutls.so", "libcurl-nss.so.4", nullptr
-    };
+    // Setting LD_LIBRARY_PATH here would be inert: glibc caches the search path at
+    // process startup, so a later setenv cannot influence dlopen. Hence absolute paths.
+    const char* chosen = nullptr;
 
-    // Ensure 32-bit lib paths are searchable
-    const char* ldPath = getenv("LD_LIBRARY_PATH");
-    if (ldPath) {
-        std::string path(ldPath);
-        if (path.find("/usr/lib32") == std::string::npos) {
-            path += ":/usr/lib32:/usr/lib/i386-linux-gnu:/usr/lib";
-            setenv("LD_LIBRARY_PATH", path.c_str(), 1);
+    // Escape hatch for layouts not covered above.
+    if (const char* envPath = getenv("CLOUDREDIRECT_LIBCURL")) {
+        if (envPath[0]) {
+            // RTLD_LOCAL: with RTLD_GLOBAL an already-loaded older libcurl can
+            // interpose its symbols on ours and we end up back on the stale TLS.
+            g_curl.handle = dlopen(envPath, RTLD_NOW | RTLD_LOCAL);
+            if (g_curl.handle) {
+                chosen = envPath;
+            } else {
+                LOG("[HTTP] CLOUDREDIRECT_LIBCURL=%s failed to load: %s", envPath, dlerror());
+            }
         }
     }
 
-    for (int i = 0; names[i]; i++) {
-        g_curl.handle = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
-        if (g_curl.handle) {
-            LOG("[HTTP] Loaded %s", names[i]);
-            break;
-        }
+    for (size_t i = 0; !g_curl.handle && i < sizeof(kCurlCandidates) / sizeof(*kCurlCandidates); i++) {
+        g_curl.handle = dlopen(kCurlCandidates[i], RTLD_NOW | RTLD_LOCAL);
+        if (g_curl.handle) chosen = kCurlCandidates[i];
     }
 
     if (!g_curl.handle) {
         LOG("[HTTP] Failed to load libcurl: %s", dlerror());
         return false;
     }
+
+    std::string resolved = ResolvedLibPath(g_curl.handle);
+    auto versionFn = (curl_version_fn)dlsym(g_curl.handle, "curl_version");
+    const char* version = versionFn ? versionFn() : nullptr;
+    // TLS backend is what matters for issue #203; log it so a bad resolution is
+    // visible without needing /proc/self/maps.
+    LOG("[HTTP] Loaded libcurl via %s (resolved: %s) -- %s",
+        chosen,
+        resolved.empty() ? "unknown" : resolved.c_str(),
+        version ? version : "version unknown");
 
     g_curl.global_init  = (curl_global_init_fn)dlsym(g_curl.handle, "curl_global_init");
     g_curl.easy_init    = (curl_easy_init_fn)dlsym(g_curl.handle, "curl_easy_init");
