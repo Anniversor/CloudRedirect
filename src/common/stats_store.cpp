@@ -130,8 +130,15 @@ static bool RefreshCloudBlobCache() {
             else
                 ++it;
         }
-        if (fetched.size() != before)
+        // Log only on change: the account blob stays contaminated between pulls, so
+        // an unconditional log here repeats on every poll (once a minute, forever).
+        static size_t lastBefore = SIZE_MAX, lastAfter = SIZE_MAX;
+        if (fetched.size() != before &&
+            (before != lastBefore || fetched.size() != lastAfter)) {
             LOG("[Stats] Cloud blob decontamination: %zu -> %zu app(s)", before, fetched.size());
+            lastBefore = before;
+            lastAfter = fetched.size();
+        }
     }
     static bool firstRefresh = true;
     size_t prevCount = g_cloudBlobByApp.size();
