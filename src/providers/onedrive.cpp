@@ -627,17 +627,20 @@ OneDriveProvider::List(const std::string& prefix) {
     return result;
 }
 
-std::vector<std::string>
-OneDriveProvider::ListSubfolders(const std::string& prefix) {
+bool OneDriveProvider::ListSubfoldersChecked(const std::string& prefix,
+                                            std::vector<std::string>& outFolders) {
+    outFolders.clear();
+
     uint32_t accountId, appId;
     std::string relPrefix;
     if (!ParsePath(prefix, accountId, appId, relPrefix)) {
-        return {};
+        LOG("[OneDriveProvider] ListSubfolders '%s': unparseable prefix", prefix.c_str());
+        return false;
     }
 
     // Only account-wide listing makes sense for subfolder enumeration
     if (appId != kNoAppId) {
-        return ICloudProvider::ListSubfolders(prefix);
+        return ICloudProvider::ListSubfoldersChecked(prefix, outFolders);
     }
 
     // GET /v1.0/me/drive/root:/CloudRedirect/{accountId}:/children?$select=name,folder
@@ -645,10 +648,17 @@ OneDriveProvider::ListSubfolders(const std::string& prefix) {
     std::string url = folderPath + "/children?$select=name,folder&$top=1000";
 
     std::string paginatedUrl = url;
-    std::vector<std::string> folders;
     while (!paginatedUrl.empty()) {
         auto r = ApiGet(paginatedUrl);
-        if (r.status != 200) break;
+        // A missing account folder means nothing has been uploaded yet.
+        if (r.status == 404) {
+            outFolders.clear();
+            return true;
+        }
+        if (r.status != 200) {
+            LOG("[OneDriveProvider] ListSubfolders '%s' failed: HTTP %d", prefix.c_str(), r.status);
+            return false;
+        }
 
         auto j = Json::Parse(r.body);
         auto& items = j["value"];
@@ -657,7 +667,7 @@ OneDriveProvider::ListSubfolders(const std::string& prefix) {
             if (!items[i]["folder"].isNull()) {
                 std::string name = items[i]["name"].str();
                 if (!name.empty()) {
-                    folders.push_back(name);
+                    outFolders.push_back(name);
                 }
             }
         }
@@ -668,8 +678,8 @@ OneDriveProvider::ListSubfolders(const std::string& prefix) {
         paginatedUrl = (pathStart != std::string::npos) ? nextLink.substr(pathStart) : std::string();
     }
 
-    LOG("[OneDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), folders.size());
-    return folders;
+    LOG("[OneDriveProvider] ListSubfolders '%s': %zu folders", prefix.c_str(), outFolders.size());
+    return true;
 }
 
 bool OneDriveProvider::ListChecked(const std::string& prefix, std::vector<FileInfo>& result,
