@@ -103,10 +103,14 @@ ApplicationWindow {
         anchors.centerIn: parent
         width: Math.min(parent.width - 80, 440)
 
-        Label {
-            text: "CloudRedirect has been updated. Please restart the application to use the new version."
-            wrapMode: Text.WordWrap
-            width: parent.width
+        ColumnLayout {
+            anchors.fill: parent
+
+            Label {
+                text: "CloudRedirect has been updated. Please restart the application to use the new version."
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+            }
         }
     }
 
