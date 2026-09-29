@@ -2,6 +2,7 @@
 #include "sigv4.h"
 #include "sha256_hmac.h"
 #include "http_util.h"
+#include "log.h"
 
 #include <ctime>
 #include <cstdio>
@@ -224,6 +225,20 @@ HttpUtil::HttpResp S3Provider::SignedRequest(
             headers.push_back(h.first + ": " + h.second);
 
         resp = m_transport->RequestUrl(method, url, body, headers);
+
+        // 404 is a normal existence-check answer; only log unexpected statuses.
+        if ((resp.status < 200 || resp.status >= 300) && resp.status != 404) {
+            std::string detail;
+            if (!resp.body.empty()) {
+                detail = " body: " + resp.body.substr(0, 200);
+                for (char& c : detail) {
+                    if (c == '\n' || c == '\r') c = ' ';
+                }
+            }
+            LOG("[S3] %s /%s -> HTTP %d (attempt %d/%d)%s%s",
+                method, objectKey.c_str(), resp.status, attempt + 1, kMaxAttempts,
+                resp.tlsFailure ? " [tls]" : "", detail.c_str());
+        }
 
         // TLS/cert failures fail identically every attempt; don't retry.
         if (resp.tlsFailure) return resp;
