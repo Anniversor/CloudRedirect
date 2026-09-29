@@ -2228,6 +2228,25 @@ void Backend::cliLaunch(const QString &cliPath, const QStringList &cliArgs,
     }
 }
 
+// Append CLI output to the same log the .so writes, in its timestamp format.
+void Backend::appendCliLog(const QString &context, const QString &text) const
+{
+    QDir().mkpath(crConfigDir());
+    QFile f(crConfigDir() + "/cloud_redirect.log");
+    if (!f.open(QIODevice::Append | QIODevice::Text))
+        return;
+
+    const QString stamp = QDateTime::currentDateTime().toString("HH:mm:ss");
+    QTextStream out(&f);
+    out << "[" << stamp << "][CLI] " << context << "\n";
+    const QStringList lines = text.split('\n');
+    for (const QString &line : lines) {
+        const QString trimmed = line.trimmed();
+        if (!trimmed.isEmpty())
+            out << "[" << stamp << "][CLI] " << trimmed << "\n";
+    }
+}
+
 void Backend::scanProvider(const QString &provider)
 {
     // Cancel any previous scan.
@@ -2420,6 +2439,7 @@ void Backend::startMigration(const QString &src, const QString &dst)
     m_migrateSrc = src;
     m_migrateDst = dst;
     m_migrateBuf.clear();
+    m_migrateErr.clear();
     m_migrateCancelled = false;
     m_migMigrated = m_migSkipped = m_migFailed = m_migDone = m_migTotal = 0;
     m_migTotalBytes = 0;
@@ -2443,6 +2463,13 @@ void Backend::startMigration(const QString &src, const QString &dst)
         }
     });
 
+    // Drain stderr as it arrives so a chatty run can't fill the pipe and stall
+    // the CLI, and so the text survives for the log even on a successful exit.
+    connect(proc, &QProcess::readyReadStandardError, this, [this, proc]() {
+        if (proc != m_migrateProc) return;
+        m_migrateErr += proc->readAllStandardError();
+    });
+
     connect(proc, &QProcess::errorOccurred, this, [this, proc](QProcess::ProcessError) {
         if (proc != m_migrateProc) return;
         if (m_migError.isEmpty() && !m_migrateCancelled)
@@ -2459,12 +2486,24 @@ void Backend::startMigration(const QString &src, const QString &dst)
             handleMigrationLine(m_migrateBuf);
         m_migrateBuf.clear();
 
+        m_migrateErr += proc->readAllStandardError();
+        const QString stderrText = QString::fromUtf8(m_migrateErr).trimmed();
+
+        // Keep the CLI's diagnostics even when the run reports success, so a
+        // "Completed with errors" summary can be traced to the failing requests.
+        if (!stderrText.isEmpty()) {
+            appendCliLog(QString("migrate %1 -> %2 (exit %3, failed %4)")
+                             .arg(m_migrateSrc, dst).arg(exitCode).arg(m_migFailed),
+                         stderrText);
+        }
+
         // A nonzero exit with a "complete" line is partial success (some files
         // failed) -- NOT fatal. Only surface stderr as a hard error when the
         // run never completed and no error was streamed.
         if (exitCode != 0 && !m_migCompleted && m_migError.isEmpty() && !m_migrateCancelled) {
-            QString err = QString::fromUtf8(proc->readAllStandardError()).trimmed();
-            m_migError = err.isEmpty() ? ("CLI exited with code " + QString::number(exitCode)) : err;
+            m_migError = stderrText.isEmpty()
+                             ? ("CLI exited with code " + QString::number(exitCode))
+                             : stderrText;
         }
         proc->deleteLater();
 
