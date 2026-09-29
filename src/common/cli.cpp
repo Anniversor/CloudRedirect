@@ -1447,6 +1447,9 @@ extern "C"
 __declspec(dllexport)
 #endif
 int CloudRedirect_CliMain(int argc, char** argv) {
+#ifndef _WIN32
+    Log::Init();
+#endif
     if (CloudRedirectCli::IsCliMode(argc, argv)) {
         return CloudRedirectCli::RunCli(argc, argv);
     }
