@@ -6,182 +6,92 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
-#include <dlfcn.h>
-#include <link.h>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
+#include <curl/curl.h>
+
 static constexpr size_t kMaxResponseSize = 64 * 1024 * 1024;
 
-// libcurl C API typedefs
-typedef void CURL;
-typedef int CURLcode;
-typedef int CURLoption;
-
-#define CURLOPT_URL            10002
-#define CURLOPT_WRITEFUNCTION  20011
-#define CURLOPT_WRITEDATA      10001
-#define CURLOPT_HTTPHEADER     10023
-#define CURLOPT_POSTFIELDS     10015
-#define CURLOPT_POSTFIELDSIZE  60
-#define CURLOPT_CUSTOMREQUEST  10036
-#define CURLOPT_NOBODY         44
-#define CURLOPT_TIMEOUT        13
-#define CURLOPT_CONNECTTIMEOUT 78
-#define CURLOPT_USERAGENT      10018
-#define CURLOPT_FOLLOWLOCATION 52
-#define CURLOPT_MAXREDIRS      68
-#define CURLOPT_HEADERFUNCTION 20079
-#define CURLOPT_HEADERDATA     10029
-#define CURLOPT_SSL_VERIFYPEER 64
-#define CURLOPT_SSL_VERIFYHOST 81
-#define CURLOPT_CAINFO         10065
-#define CURLINFO_RESPONSE_CODE 0x200002
-
-typedef int  (*curl_global_init_fn)(long);
-typedef CURL* (*curl_easy_init_fn)(void);
-typedef CURLcode (*curl_easy_setopt_fn)(CURL*, CURLoption, ...);
-typedef CURLcode (*curl_easy_perform_fn)(CURL*);
-typedef CURLcode (*curl_easy_getinfo_fn)(CURL*, int, ...);
-typedef void (*curl_easy_cleanup_fn)(CURL*);
-typedef struct curl_slist* (*curl_slist_append_fn)(struct curl_slist*, const char*);
-typedef void (*curl_slist_free_all_fn)(struct curl_slist*);
-typedef const char* (*curl_version_fn)(void);
-
-#define CURL_GLOBAL_ALL 3  // CURL_GLOBAL_SSL | CURL_GLOBAL_WIN32
-
-struct CurlAPI {
-    void* handle = nullptr;
-    curl_global_init_fn global_init = nullptr;
-    curl_easy_init_fn easy_init = nullptr;
-    curl_easy_setopt_fn easy_setopt = nullptr;
-    curl_easy_perform_fn easy_perform = nullptr;
-    curl_easy_getinfo_fn easy_getinfo = nullptr;
-    curl_easy_cleanup_fn easy_cleanup = nullptr;
-    curl_slist_append_fn slist_append = nullptr;
-    curl_slist_free_all_fn slist_free_all = nullptr;
-};
-
-static CurlAPI g_curl{};
-static bool g_curlInitAttempted = false;
+static bool g_curlInitDone = false;
 static std::mutex g_curlInitMutex;
 
-// 32-bit libcurl: curl_easy_init/cleanup race shared SSL tables.
-// Guard handle lifecycle (not perform) under mutex.
+static std::string g_caBundle;
+static std::string g_caCertDir;
+
+// curl_easy_init/cleanup can race internal OpenSSL global tables.
 static std::mutex g_curlHandleMutex;
 
-// Absolute system paths are tried before bare sonames. Inside the Steam scout
-// runtime a bare dlopen("libcurl.so.4") resolves to the runtime's 2018 copy,
-// linked against GnuTLS 3.6.2, which cannot verify current certificate chains --
-// every request fails with CURLE_PEER_FAILED_VERIFICATION (60).
-static const char* const kCurlCandidates[] = {
-#if defined(__i386__)
-    "/usr/lib32/libcurl.so.4",
-    "/usr/lib/i386-linux-gnu/libcurl.so.4",
-    "/lib/i386-linux-gnu/libcurl.so.4",
-    "/usr/lib32/libcurl-gnutls.so.4",
-    "/usr/lib/i386-linux-gnu/libcurl-gnutls.so.4",
-#elif defined(__x86_64__)
-    "/usr/lib64/libcurl.so.4",
-    "/usr/lib/x86_64-linux-gnu/libcurl.so.4",
-    "/lib/x86_64-linux-gnu/libcurl.so.4",
-    "/usr/lib64/libcurl-gnutls.so.4",
-    "/usr/lib/x86_64-linux-gnu/libcurl-gnutls.so.4",
-#endif
-    "libcurl.so.4", "libcurl.so", "libcurl-gnutls.so.4",
-    "libcurl-gnutls.so", "libcurl-nss.so.4",
-};
-
-// Path glibc actually resolved the handle to, for diagnostics.
-// Gate on __USE_GNU, not RTLD_DI_LINKMAP: the latter is an enum constant rather
-// than a macro, so an #ifdef on it is always false and silently kills this.
-static std::string ResolvedLibPath(void* handle) {
-#ifdef __USE_GNU
-    struct link_map* lm = nullptr;
-    if (dlinfo(handle, RTLD_DI_LINKMAP, &lm) == 0 && lm && lm->l_name && lm->l_name[0]) {
-        return lm->l_name;
-    }
-#else
-    (void)handle;
-#endif
-    return {};
-}
-
-static bool InitCurl() {
-    // Serialize init and call curl_global_init() explicitly here -- libcurl's lazy
-    // global init off the first curl_easy_init isn't thread-safe and crashed when
-    // EndSession raced a background worker.
-    std::lock_guard<std::mutex> lock(g_curlInitMutex);
-    if (g_curlInitAttempted) return g_curl.handle != nullptr;
-    g_curlInitAttempted = true;
-
-    // Setting LD_LIBRARY_PATH here would be inert: glibc caches the search path at
-    // process startup, so a later setenv cannot influence dlopen. Hence absolute paths.
-    const char* chosen = nullptr;
-
-    // Escape hatch for layouts not covered above.
-    if (const char* envPath = getenv("CLOUDREDIRECT_LIBCURL")) {
-        if (envPath[0]) {
-            // RTLD_LOCAL: with RTLD_GLOBAL an already-loaded older libcurl can
-            // interpose its symbols on ours and we end up back on the stale TLS.
-            g_curl.handle = dlopen(envPath, RTLD_NOW | RTLD_LOCAL);
-            if (g_curl.handle) {
-                chosen = envPath;
-            } else {
-                LOG("[HTTP] CLOUDREDIRECT_LIBCURL=%s failed to load: %s", envPath, dlerror());
-            }
+// Probe well-known CA bundle locations.
+// Environment variables take priority, then standard paths.
+static void ProbeSystemCaBundle() {
+    for (const char* var : {"SSL_CERT_FILE", "CURL_CA_BUNDLE"}) {
+        const char* v = getenv(var);
+        if (v && v[0] && access(v, R_OK) == 0) {
+            g_caBundle = v;
+            LOG("[HTTP] CA bundle from %s: %s", var, v);
+            return;
         }
     }
 
-    for (size_t i = 0; !g_curl.handle && i < sizeof(kCurlCandidates) / sizeof(*kCurlCandidates); i++) {
-        g_curl.handle = dlopen(kCurlCandidates[i], RTLD_NOW | RTLD_LOCAL);
-        if (g_curl.handle) chosen = kCurlCandidates[i];
+    static const char* const kCaBundlePaths[] = {
+        "/etc/ssl/certs/ca-certificates.crt",               // Debian/Ubuntu/Arch/Alpine/Gentoo/Void/NixOS
+        "/etc/pki/tls/certs/ca-bundle.crt",                 // Fedora/RHEL/CentOS
+        "/etc/ssl/ca-bundle.pem",                           // openSUSE
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",// Fedora alt
+        "/etc/ssl/cert.pem",                                // Alpine/Arch/Void symlink
+        "/etc/ca-certificates/extracted/tls-ca-bundle.pem", // Arch p11-kit
+    };
+
+    for (const char* path : kCaBundlePaths) {
+        if (access(path, R_OK) == 0) {
+            g_caBundle = path;
+            LOG("[HTTP] CA bundle: %s", path);
+            break;
+        }
     }
 
-    if (!g_curl.handle) {
-        LOG("[HTTP] Failed to load libcurl: %s", dlerror());
+    for (const char* var : {"SSL_CERT_DIR"}) {
+        const char* v = getenv(var);
+        if (v && v[0] && access(v, R_OK) == 0) {
+            g_caCertDir = v;
+            LOG("[HTTP] CA dir from %s: %s", var, v);
+            return;
+        }
+    }
+    static const char* const kCaDirPaths[] = {
+        "/etc/ssl/certs",
+        "/etc/pki/tls/certs",
+    };
+    for (const char* path : kCaDirPaths) {
+        if (access(path, R_OK) == 0) {
+            g_caCertDir = path;
+            break;
+        }
+    }
+
+    if (g_caBundle.empty() && g_caCertDir.empty())
+        LOG("[HTTP] WARNING: no system CA bundle found; TLS verification may fail");
+}
+
+static bool InitCurl() {
+    std::lock_guard<std::mutex> lock(g_curlInitMutex);
+    if (g_curlInitDone) return true;
+
+    CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
+    if (rc != CURLE_OK) {
+        LOG("[HTTP] curl_global_init failed: %d", (int)rc);
         return false;
     }
 
-    std::string resolved = ResolvedLibPath(g_curl.handle);
-    auto versionFn = (curl_version_fn)dlsym(g_curl.handle, "curl_version");
-    const char* version = versionFn ? versionFn() : nullptr;
-    // TLS backend is what matters for issue #203; log it so a bad resolution is
-    // visible without needing /proc/self/maps.
-    LOG("[HTTP] Loaded libcurl via %s (resolved: %s) -- %s",
-        chosen,
-        resolved.empty() ? "unknown" : resolved.c_str(),
-        version ? version : "version unknown");
+    const char* ver = curl_version();
+    LOG("[HTTP] Linked libcurl %s (static, OpenSSL)", ver ? ver : "unknown");
 
-    g_curl.global_init  = (curl_global_init_fn)dlsym(g_curl.handle, "curl_global_init");
-    g_curl.easy_init    = (curl_easy_init_fn)dlsym(g_curl.handle, "curl_easy_init");
-    g_curl.easy_setopt  = (curl_easy_setopt_fn)dlsym(g_curl.handle, "curl_easy_setopt");
-    g_curl.easy_perform = (curl_easy_perform_fn)dlsym(g_curl.handle, "curl_easy_perform");
-    g_curl.easy_getinfo = (curl_easy_getinfo_fn)dlsym(g_curl.handle, "curl_easy_getinfo");
-    g_curl.easy_cleanup = (curl_easy_cleanup_fn)dlsym(g_curl.handle, "curl_easy_cleanup");
-    g_curl.slist_append = (curl_slist_append_fn)dlsym(g_curl.handle, "curl_slist_append");
-    g_curl.slist_free_all = (curl_slist_free_all_fn)dlsym(g_curl.handle, "curl_slist_free_all");
-
-    if (!g_curl.easy_init || !g_curl.easy_setopt || !g_curl.easy_perform ||
-        !g_curl.easy_getinfo || !g_curl.easy_cleanup) {
-        LOG("[HTTP] libcurl missing required symbols");
-        dlclose(g_curl.handle);
-        g_curl.handle = nullptr;
-        return false;
-    }
-
-    // Explicit global init (once, under the mutex) -- required before any
-    // curl_easy_init and must not be left to libcurl's non-thread-safe lazy path.
-    if (g_curl.global_init) {
-        g_curl.global_init(CURL_GLOBAL_ALL);
-        LOG("[HTTP] curl_global_init done");
-    } else {
-        LOG("[HTTP] WARNING: curl_global_init symbol missing; relying on lazy init");
-    }
-
+    ProbeSystemCaBundle();
+    g_curlInitDone = true;
     return true;
 }
 
@@ -198,7 +108,6 @@ static size_t HeaderCallback(const char* data, size_t size, size_t nmemb, std::s
     return total;
 }
 
-// Extract Location header from raw header block
 static std::string ExtractLocation(const std::string& headers) {
     for (const char* key : {"Location: ", "location: "}) {
         size_t pos = headers.find(key);
@@ -211,8 +120,6 @@ static std::string ExtractLocation(const std::string& headers) {
     return {};
 }
 
-// Parse the raw header block into a lower-cased name -> value map.
-// Skips the HTTP status line and folds duplicate names to the last value.
 static void ParseHeaders(const std::string& raw, std::map<std::string, std::string>& out) {
     size_t pos = 0;
     while (pos < raw.size()) {
@@ -221,7 +128,7 @@ static void ParseHeaders(const std::string& raw, std::map<std::string, std::stri
         pos = (eol == std::string::npos) ? raw.size() : eol + 1;
         if (!line.empty() && line.back() == '\r') line.pop_back();
         size_t colon = line.find(':');
-        if (colon == std::string::npos) continue;  // status line or blank
+        if (colon == std::string::npos) continue;
         std::string name = line.substr(0, colon);
         for (char& c : name) c = (char)tolower((unsigned char)c);
         size_t vs = colon + 1;
@@ -230,21 +137,18 @@ static void ParseHeaders(const std::string& raw, std::map<std::string, std::stri
     }
 }
 
-// TLS handshake, cipher and certificate-trust failures. These reflect a bad
-// endpoint, clock, or CA configuration rather than a transient network fault,
-// so retrying them only burns the caller's time budget.
-static bool IsCurlTlsFailure(int res) {
+static bool IsCurlTlsFailure(CURLcode res) {
     switch (res) {
-        case 35:  // CURLE_SSL_CONNECT_ERROR
-        case 58:  // CURLE_SSL_CERTPROBLEM
-        case 59:  // CURLE_SSL_CIPHER
-        case 60:  // CURLE_PEER_FAILED_VERIFICATION
-        case 64:  // CURLE_USE_SSL_FAILED
-        case 66:  // CURLE_SSL_ENGINE_INITFAILED
-        case 77:  // CURLE_SSL_CACERT_BADFILE
-        case 83:  // CURLE_SSL_ISSUER_ERROR
-        case 90:  // CURLE_SSL_PINNEDPUBKEYNOTMATCH
-        case 91:  // CURLE_SSL_INVALIDCERTSTATUS
+        case CURLE_SSL_CONNECT_ERROR:
+        case CURLE_SSL_CERTPROBLEM:
+        case CURLE_SSL_CIPHER:
+        case CURLE_PEER_FAILED_VERIFICATION:
+        case CURLE_USE_SSL_FAILED:
+        case CURLE_SSL_ENGINE_INITFAILED:
+        case CURLE_SSL_CACERT_BADFILE:
+        case CURLE_SSL_ISSUER_ERROR:
+        case CURLE_SSL_PINNEDPUBKEYNOTMATCH:
+        case CURLE_SSL_INVALIDCERTSTATUS:
             return true;
         default:
             return false;
@@ -271,7 +175,6 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
         return resp;
     }
 
-    // Encode bare spaces in URL (libcurl rejects them with CURLE_URL_MALFORMAT)
     std::string safeUrl;
     safeUrl.reserve(url.size());
     for (char c : url) {
@@ -282,73 +185,73 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
     CURL* curl;
     {
         std::lock_guard<std::mutex> lock(g_curlHandleMutex);
-        curl = g_curl.easy_init();
+        curl = curl_easy_init();
     }
     if (!curl) return resp;
 
     std::string responseBody;
     std::string responseHeaders;
 
-    g_curl.easy_setopt(curl, CURLOPT_URL, safeUrl.c_str());
-    g_curl.easy_setopt(curl, CURLOPT_WRITEFUNCTION, (void*)WriteCallback);
-    g_curl.easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
-    g_curl.easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
-    g_curl.easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-    g_curl.easy_setopt(curl, CURLOPT_USERAGENT, "CloudRedirect/1.0");
-    // Follow redirects only on token-stripped requests (mirrors WinHTTP defaults).
-    g_curl.easy_setopt(curl, CURLOPT_FOLLOWLOCATION, followRedirects ? 1L : 0L);
+    curl_easy_setopt(curl, CURLOPT_URL, safeUrl.c_str());
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, (void*)WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &responseBody);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeout);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "CloudRedirect/1.0");
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, followRedirects ? 1L : 0L);
     if (followRedirects)
-        g_curl.easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
 
     if (captureHeaders) {
-        g_curl.easy_setopt(curl, CURLOPT_HEADERFUNCTION, (void*)HeaderCallback);
-        g_curl.easy_setopt(curl, CURLOPT_HEADERDATA, &responseHeaders);
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, (void*)HeaderCallback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, &responseHeaders);
     }
 
-    // TLS relaxation for self-hosted endpoints (self-signed / internal CA).
-    if (opts) {
-        if (opts->allowInsecureTls) {
-            g_curl.easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-            g_curl.easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-        } else if (!opts->caCertPath.empty()) {
-            g_curl.easy_setopt(curl, CURLOPT_CAINFO, opts->caCertPath.c_str());
-        }
+    // TLS: per-provider overrides first, then the probed system bundle.
+    bool tlsRelaxed = opts && opts->allowInsecureTls;
+    if (tlsRelaxed) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    } else if (opts && !opts->caCertPath.empty()) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, opts->caCertPath.c_str());
+    } else {
+        if (!g_caBundle.empty())
+            curl_easy_setopt(curl, CURLOPT_CAINFO, g_caBundle.c_str());
+        if (!g_caCertDir.empty())
+            curl_easy_setopt(curl, CURLOPT_CAPATH, g_caCertDir.c_str());
     }
 
     if (strcmp(method, "GET") != 0)
-        g_curl.easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
 
-    // Without NOBODY, HEAD blocks waiting for a body until the timeout fires.
     if (strcmp(method, "HEAD") == 0)
-        g_curl.easy_setopt(curl, CURLOPT_NOBODY, 1L);
+        curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
 
     if (!body.empty()) {
-        g_curl.easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-        g_curl.easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.size());
     }
 
     struct curl_slist* slist = nullptr;
-    if (g_curl.slist_append) {
-        for (const auto& h : hdrs)
-            slist = g_curl.slist_append(slist, h.c_str());
-        if (slist)
-            g_curl.easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
-    }
+    for (const auto& h : hdrs)
+        slist = curl_slist_append(slist, h.c_str());
+    if (slist)
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, slist);
 
-    CURLcode res = g_curl.easy_perform(curl);
+    CURLcode res = curl_easy_perform(curl);
 
     long httpCode = 0;
-    g_curl.easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
-    if (slist && g_curl.slist_free_all) g_curl.slist_free_all(slist);
+    if (slist) curl_slist_free_all(slist);
     {
         std::lock_guard<std::mutex> lock(g_curlHandleMutex);
-        g_curl.easy_cleanup(curl);
+        curl_easy_cleanup(curl);
     }
 
-    if (res != 0) {
+    if (res != CURLE_OK) {
         resp.tlsFailure = IsCurlTlsFailure(res);
-        LOG("%s curl failed: %d (%s %s)", logTag, res, method, url.c_str());
+        LOG("%s curl failed: %d (%s %s)", logTag, (int)res, method, url.c_str());
         return resp;
     }
 
@@ -365,13 +268,13 @@ static HttpUtil::HttpResp CurlRequest(const char* logTag, const char* method,
     return resp;
 }
 
-class DlopenCurlTransport : public IHttpTransport {
+class StaticCurlTransport : public IHttpTransport {
 public:
-    explicit DlopenCurlTransport(const char* logTag) : m_logTag(logTag) {}
+    explicit StaticCurlTransport(const char* logTag) : m_logTag(logTag) {}
 
     bool Init() override { return InitCurl(); }
     void Shutdown() override {}
-    bool IsReady() const override { return g_curl.handle != nullptr; }
+    bool IsReady() const override { return g_curlInitDone; }
     void SetOptions(const TransportOptions& opts) override { m_opts = opts; }
 
     HttpUtil::HttpResp Request(const char* method, const char* host,
@@ -406,7 +309,6 @@ public:
     const char* m_logTag;
 
 private:
-    // host+path helpers use https unless plaintext HTTP was explicitly enabled.
     std::string Scheme() const {
         return m_opts.allowInsecureHttp ? "http://" : "https://";
     }
@@ -414,5 +316,5 @@ private:
 };
 
 std::unique_ptr<IHttpTransport> CreateHttpTransport(const char* logTag) {
-    return std::make_unique<DlopenCurlTransport>(logTag);
+    return std::make_unique<StaticCurlTransport>(logTag);
 }

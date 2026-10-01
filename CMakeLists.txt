@@ -179,6 +179,17 @@ else()
     if(LINUX_32BIT)
         target_compile_options(cloud_redirect PRIVATE -m32)
         target_link_options(cloud_redirect PRIVATE -m32)
+
+        if(NOT DEFINED DEPS32_PREFIX)
+            set(DEPS32_PREFIX "${CMAKE_SOURCE_DIR}/deps/install32")
+        endif()
+        set(DEPS32 "${DEPS32_PREFIX}")
+        target_include_directories(cloud_redirect PRIVATE "${DEPS32}/include")
+        target_link_libraries(cloud_redirect PRIVATE
+            "${DEPS32}/lib/libcurl.a"
+            "${DEPS32}/lib/libssl.a"
+            "${DEPS32}/lib/libcrypto.a"
+        )
         target_link_libraries(cloud_redirect PRIVATE atomic)
         # Fix multilib include path for i686 libstdc++ headers on Fedora
         # Try to detect GCC version for correct path
@@ -374,6 +385,14 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/autocloud_native_tests.cpp)
             src/platform/linux/token_store_linux.cpp
         )
         target_link_libraries(cloud_storage_staging_tests PRIVATE pthread dl)
+        if(LINUX_32BIT)
+            target_include_directories(cloud_storage_staging_tests PRIVATE "${DEPS32}/include")
+            target_link_libraries(cloud_storage_staging_tests PRIVATE
+                "${DEPS32}/lib/libcurl.a"
+                "${DEPS32}/lib/libssl.a"
+                "${DEPS32}/lib/libcrypto.a"
+            )
+        endif()
     endif()
     add_test(NAME cloud_storage_staging_tests COMMAND cloud_storage_staging_tests)
 
