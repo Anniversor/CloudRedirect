@@ -2641,8 +2641,6 @@ static uintptr_t ResolveServiceTransportVtableViaRtti(uintptr_t scBase) {
     return vtEa;
 }
 
-// One-shot warning when the vtable hook can't be installed; modal dialog on detached thread.
-static std::atomic<bool> g_vtableHookFailureNotified{false};
 static void RefuseVtableHook(const char* reasonFmt, ...) {
     char reason[512];
     va_list ap;
@@ -2651,41 +2649,6 @@ static void RefuseVtableHook(const char* reasonFmt, ...) {
     va_end(ap);
 
     LOG("[VtHook] REFUSED: %s", reason);
-
-    if (g_vtableHookFailureNotified.exchange(true)) return;
-
-    uint64_t ver = g_detectedSteamVersion.load(std::memory_order_relaxed);
-    char msg[1024];
-    if (ver != 0) {
-        snprintf(msg, sizeof(msg),
-            "Your Steam client (version %llu) is newer than what "
-            "CloudRedirect supports.\n\n"
-            "Update CloudRedirect to match your Steam version.\n\n"
-            "Cloud saves will not be redirected. STFixer patches will still apply.\n\n"
-            "Reason: %s",
-            ver, reason);
-    } else {
-        snprintf(msg, sizeof(msg),
-            "CloudRedirect could not identify required addresses in "
-            "steamclient64.dll.\n\n"
-            "Update CloudRedirect to match your Steam version.\n\n"
-            "Cloud saves will not be redirected. STFixer patches will still apply.\n\n"
-            "Reason: %s",
-            reason);
-    }
-    std::string msgStr(msg);
-    std::thread t([msgStr]() {
-        if (g_shuttingDown.load(std::memory_order_acquire)) return;
-        MessageBoxA(nullptr, msgStr.c_str(),
-            "CloudRedirect -- Incompatible Steam Update",
-            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND);
-    });
-    std::lock_guard<std::mutex> lock(g_bgThreadsMutex);
-    if (g_shuttingDown.load(std::memory_order_acquire)) {
-        t.detach();
-    } else {
-        g_bgThreads.push_back(std::move(t));
-    }
 }
 
 // Lock-free body; caller must hold s_installMutex (declared in InstallServiceMethodHook).
