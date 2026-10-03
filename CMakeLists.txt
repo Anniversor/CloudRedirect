@@ -192,6 +192,8 @@ else()
             "${DEPS32}/lib/libssl.a"
             "${DEPS32}/lib/libcrypto.a"
         )
+        # Hide static curl/OpenSSL symbols so they can't be interposed.
+        target_link_options(cloud_redirect PRIVATE -Wl,--exclude-libs,ALL)
         target_link_libraries(cloud_redirect PRIVATE atomic)
         # Fix multilib include path for i686 libstdc++ headers on Fedora
         # Try to detect GCC version for correct path
