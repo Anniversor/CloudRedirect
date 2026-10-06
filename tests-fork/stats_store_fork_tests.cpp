@@ -1,9 +1,13 @@
 // Fork regression tests for stats_store.cpp: cross-device playtime
 // (ApplyLocalconfigPlaytime and the migrated-bucket adoption in MergePlaytime)
-// and the legacy per-app blob migration in SeedApps.
+// and the legacy per-app blob migration in SeedApps; plus the Player.GetUserStats
+// answer in stats_handlers.cpp.
 // No framework: each CHECK reports a failure with file/line; the exit code is
 // the number of failures. Built and run by .github/workflows/windows-release.yml.
 #include "stats_store.h"
+#include "stats_handlers.h"
+#include "metadata_sync.h"
+#include "protobuf.h"
 #include "json.h"
 
 #include <chrono>
@@ -388,6 +392,136 @@ static void LegacyListingNeverOverridesAccountBlob() {
     CHECK(SeededMinutes(300) == 0);
 }
 
+// --- Player.GetUserStats answers (stats_handlers.cpp) ---
+
+static constexpr uint32_t kStatsApp = 2458860;
+static constexpr uint32_t kStatsAccount = 1397805883u;
+static constexpr uint64_t kStatsSteamId = 76561197960265728ull + kStatsAccount;
+
+// The schema blob is opaque to the handler; "abc" has a well-known SHA-1, which
+// also pins the hash to plain SHA-1 over the raw bytes (what Steam sends).
+static const std::vector<uint8_t> kSchema = {'a', 'b', 'c'};
+static const std::vector<uint8_t> kSchemaSha = {
+    0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e,
+    0x25, 0x71, 0x78, 0x50, 0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d};
+
+struct UserStatsReply {
+    bool answered = false;        // false: passed through to Steam
+    std::vector<uint8_t> sha;     // sha_schema (1)
+    bool hasCrc = false;
+    uint32_t crc = 0;             // crc_stats (2)
+    bool hasSchema = false;       // schema (3)
+    size_t stats = 0;             // stats (4)
+};
+
+// A fresh store for kStatsAccount holding kSchema for kStatsApp and, if
+// withStats, one achievement stat. Returns the store's crc_stats.
+static uint32_t SetUpStatsStore(int caseNo, bool withStats) {
+    namespace fs = std::filesystem;
+    auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    fs::path root = fs::temp_directory_path() /
+        ("cr_fork_userstats_" + std::to_string(stamp) + "_" + std::to_string(caseNo));
+    std::error_code ec;
+    fs::create_directories(root / "steam", ec);
+    g_tempRoots.push_back(root);
+
+    StatsStore::ResetForTesting();
+    StatsStore::Init((root / "cloud").string(), (root / "steam").string());
+    StatsStore::SetAccountIdProvider([] { return kStatsAccount; });
+    StatsStore::ResetForAccountSwitch(kStatsAccount);
+    MetadataSync::syncAchievements.store(false);   // no seed to wait for
+    StatsStore::SetSchema(kStatsApp, kSchema.data(), kSchema.size());
+    if (!withStats)
+        return StatsStore::Snapshot(kStatsApp).crcStats;
+    StatsStore::SetStats(kStatsApp, {{1, 0x3}});
+    return StatsStore::SetAchievement(kStatsApp, 1, 0, 1759600000);
+}
+
+// steamId 0 / sha nullptr leave the field out of the request.
+static UserStatsReply AskUserStats(uint64_t steamId, const std::vector<uint8_t>* sha, uint32_t crc) {
+    PB::Writer req;
+    if (steamId) req.WriteVarint(1, steamId);
+    req.WriteVarint(2, kStatsApp);
+    if (sha) req.WriteBytes(3, sha->data(), sha->size());
+    req.WriteVarint(4, crc);
+    std::vector<uint8_t> reqBytes = req.Data();
+    auto res = StatsHandlers::HandleGetUserStats(kStatsApp, PB::Parse(reqBytes.data(), reqBytes.size()));
+
+    UserStatsReply r;
+    std::vector<uint8_t> body = res.body.Data();
+    r.answered = !body.empty();
+    for (const auto& f : PB::Parse(body.data(), body.size())) {
+        if (f.fieldNum == 1) r.sha.assign(f.data, f.data + f.dataLen);
+        else if (f.fieldNum == 2) { r.hasCrc = true; r.crc = (uint32_t)f.varintVal; }
+        else if (f.fieldNum == 3) r.hasSchema = true;
+        else if (f.fieldNum == 4) ++r.stats;
+    }
+    return r;
+}
+
+// Same schema, same stats: nothing to send but the tokens.
+static void UserStatsInSyncIsNoOp() {
+    uint32_t crc = SetUpStatsStore(1, true);
+    auto r = AskUserStats(kStatsSteamId, &kSchemaSha, crc);
+    CHECK(r.answered);
+    CHECK(r.sha == kSchemaSha);
+    CHECK(r.hasCrc && r.crc == crc);
+    CHECK(!r.hasSchema);
+    CHECK(r.stats == 0);
+}
+
+// The 0% global-unlock-rate regression: a stats change (every unlock) must not
+// re-send a schema the client already holds, or Steam reloads it mid-session.
+static void UserStatsChangeKeepsKnownSchema() {
+    uint32_t crc = SetUpStatsStore(2, true);
+    auto r = AskUserStats(kStatsSteamId, &kSchemaSha, crc ^ 0x5a5a5a5au);
+    CHECK(r.answered);
+    CHECK(!r.hasSchema);
+    CHECK(r.stats == 1);
+    CHECK(r.hasCrc && r.crc == crc);
+    CHECK(r.sha == kSchemaSha);
+}
+
+// A client without a schema gets it even when its crc already matches.
+static void UserStatsMissingSchemaIsSent() {
+    uint32_t crc = SetUpStatsStore(3, true);
+    auto r = AskUserStats(kStatsSteamId, nullptr, crc);
+    CHECK(r.answered);
+    CHECK(r.hasSchema);
+    CHECK(r.stats == 0);
+    CHECK(r.sha == kSchemaSha);
+}
+
+// Both crcs zero (no stats yet) is not proof the client has the schema.
+static void UserStatsZeroCrcStillSendsSchema() {
+    uint32_t crc = SetUpStatsStore(4, false);
+    auto r = AskUserStats(kStatsSteamId, nullptr, crc);
+    CHECK(r.answered);
+    CHECK(r.hasSchema);
+    CHECK(r.hasCrc && r.crc == crc);
+}
+
+// A client holding a different schema gets ours (stats unchanged: none sent).
+static void UserStatsDifferentSchemaIsReplaced() {
+    uint32_t crc = SetUpStatsStore(5, true);
+    std::vector<uint8_t> otherSha(20, 0xab);
+    auto r = AskUserStats(kStatsSteamId, &otherSha, crc);
+    CHECK(r.answered);
+    CHECK(r.hasSchema);
+    CHECK(r.stats == 0);
+    CHECK(r.sha == kSchemaSha);
+}
+
+// Another player's stats are not ours to answer; a request without a steamid is.
+static void UserStatsOtherAccountPassesThrough() {
+    uint32_t crc = SetUpStatsStore(6, true);
+    auto other = AskUserStats(kStatsSteamId + 1, &kSchemaSha, crc ^ 1u);
+    CHECK(!other.answered);
+    auto unnamed = AskUserStats(0, &kSchemaSha, crc ^ 1u);
+    CHECK(unnamed.answered);
+    CHECK(unnamed.stats == 1);
+}
+
 int main() {
     ReconcileKeepsOtherDevicesMinutes();
     ReconcileAddsShortfallToOwnField();
@@ -407,6 +541,12 @@ int main() {
     LegacyListingFailedProbesEveryCandidate();
     NoLegacyListerProbesEveryCandidate();
     LegacyListingNeverOverridesAccountBlob();
+    UserStatsInSyncIsNoOp();
+    UserStatsChangeKeepsKnownSchema();
+    UserStatsMissingSchemaIsSent();
+    UserStatsZeroCrcStillSendsSchema();
+    UserStatsDifferentSchemaIsReplaced();
+    UserStatsOtherAccountPassesThrough();
     for (const auto& root : g_tempRoots) {
         std::error_code ec;
         std::filesystem::remove_all(root, ec);
