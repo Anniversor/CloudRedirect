@@ -43,7 +43,8 @@ jobs:
         run: |
           set -e
           apt-get update
-          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make python3-pip
+          # perl: OpenSSL's Configure needs the full module set, not just perl-base.
+          apt-get install -y --no-install-recommends software-properties-common ca-certificates gnupg git curl file binutils make perl python3-pip
           add-apt-repository -y ppa:ubuntu-toolchain-r/test
           apt-get update
           # The unversioned multilib packages also provide the i386 asm/ kernel headers
@@ -70,6 +71,57 @@ jobs:
           sed -i "s|<ReleaseVersion>[^<]*</ReleaseVersion>|<ReleaseVersion>$version</ReleaseVersion>|" Version.props
           echo "ReleaseVersion set to $version"
 
+      # Since 2.6.6 the .so links libcurl and OpenSSL statically from deps/install32
+      # (CMakeLists.txt), which upstream builds outside the repo. Build them here:
+      # current patch releases, configured like upstream's .so (no zlib, HTTP/2,
+      # PSL or IDN, so the only runtime dependencies stay libc/libstdc++).
+      - name: Cache static 32-bit OpenSSL and libcurl
+        id: deps32
+        uses: actions/cache@v4
+        with:
+          path: deps/install32
+          key: deps32-ubuntu20.04-gcc12-openssl-3.5.9-curl-8.22.0-v1
+
+      - name: Build static 32-bit OpenSSL and libcurl into deps/install32
+        if: steps.deps32.outputs.cache-hit != 'true'
+        env:
+          OPENSSL_VERSION: 3.5.9
+          OPENSSL_SHA256: 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
+          CURL_VERSION: 8.22.0
+          CURL_SHA256: d54dd598bf05927a726deb38df31c6a255ba83ff1de57c5d1464dac3ed8f44a1
+        run: |
+          set -e
+          prefix="$PWD/deps/install32"
+          work=$(mktemp -d)
+          cd "$work"
+          curl -fsSLO "https://github.com/openssl/openssl/releases/download/openssl-$OPENSSL_VERSION/openssl-$OPENSSL_VERSION.tar.gz"
+          echo "$OPENSSL_SHA256  openssl-$OPENSSL_VERSION.tar.gz" | sha256sum -c -
+          curl -fsSLO "https://curl.se/download/curl-$CURL_VERSION.tar.gz"
+          echo "$CURL_SHA256  curl-$CURL_VERSION.tar.gz" | sha256sum -c -
+
+          tar xzf "openssl-$OPENSSL_VERSION.tar.gz"
+          cd "openssl-$OPENSSL_VERSION"
+          # -fPIC: these archives end up inside a shared object.
+          CC=gcc-12 ./Configure linux-x86 -m32 -fPIC no-shared no-tests \
+            --prefix="$prefix" --libdir=lib --openssldir="$prefix/ssl"
+          make -j"$(nproc)" build_libs
+          make install_dev
+          cd ..
+
+          tar xzf "curl-$CURL_VERSION.tar.gz"
+          cd "curl-$CURL_VERSION"
+          CC=gcc-12 CFLAGS="-m32 -fPIC -O2" LDFLAGS="-m32" LIBS="-ldl -pthread" \
+            ./configure --build=x86_64-pc-linux-gnu --host=i686-pc-linux-gnu \
+              --prefix="$prefix" --libdir="$prefix/lib" \
+              --disable-shared --enable-static --with-pic --with-openssl="$prefix" \
+              --without-zlib --without-brotli --without-zstd --without-libpsl --without-libidn2 \
+              --without-nghttp2 --without-libssh2 --without-librtmp \
+              --disable-ldap --disable-ldaps --disable-manual --disable-docs
+          make -j"$(nproc)" -C lib
+          make -C lib install
+          make -C include install
+          ls -l "$prefix/lib"
+
       - name: Build 32-bit cloud_redirect.so and cloud_redirect_cli
         run: |
           set -e
@@ -85,6 +137,9 @@ jobs:
             file "$f"
             file "$f" | grep -q 'ELF 32-bit' || { echo "$f is not a 32-bit ELF"; exit 1; }
             echo "$f: newest glibc symbol version $(objdump -T "$f" | grep -o 'GLIBC_[0-9.]*' | sort -Vu | tail -1)"
+            # The static OpenSSL assembly must not leave text relocations behind.
+            if readelf -d "$f" | grep -q TEXTREL; then echo "$f has text relocations"; exit 1; fi
+            readelf -d "$f" | grep NEEDED
           done
 
       - name: Build and run fork unit tests (64-bit host build of the shared code)
@@ -131,8 +186,11 @@ jobs:
           # The version 'flatpak remote-info' reports (what the app's update check
           # compares against) is the newest <release> in the metainfo.
           date=$(date -u +%Y-%m-%d)
-          sed -i "0,/<releases>/s|<releases>|<releases>\n    <release version=\"$version\" date=\"$date\" />|" \
-            flatpak/org.cloudredirect.CloudRedirect.metainfo.xml
+          # Upstream lists its own releases there too; a plain vX.Y.Z tag may already be present.
+          if ! grep -q "<release version=\"$version\"" flatpak/org.cloudredirect.CloudRedirect.metainfo.xml; then
+            sed -i "0,/<releases>/s|<releases>|<releases>\n    <release version=\"$version\" date=\"$date\" />|" \
+              flatpak/org.cloudredirect.CloudRedirect.metainfo.xml
+          fi
           grep -m1 '<release ' flatpak/org.cloudredirect.CloudRedirect.metainfo.xml
 
       - name: Download native binaries
