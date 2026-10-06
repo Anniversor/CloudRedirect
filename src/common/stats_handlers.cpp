@@ -1,6 +1,7 @@
 #include "stats_handlers.h"
 #include "stats_store.h"
 #include "metadata_sync.h"
+#include "file_util.h"
 #include "protobuf.h"
 #include "log.h"
 
@@ -30,17 +31,41 @@ void Init() {
     LOG("[Stats] Handlers initialized");
 }
 
-// Player.GetUserStats#1 handler. Wire: req{appid(2),crc(4)} -> resp{crc(2),schema(3),stats(4)}.
+// Player.GetUserStats#1 handler.
+// Wire: req{steamid(1),appid(2),sha_schema(3),crc(4)} -> resp{sha_schema(1),crc(2),schema(3),stats(4)}.
+// Like Steam's server, send the schema only when the client has none or a
+// different one, and the stats only when its crc differs. sha_schema is the
+// SHA-1 of the schema blob, the same bytes Steam keeps (and hashes for the
+// request) in appcache/stats/UserGameStatsSchema_<appid>.bin. Re-sending an
+// identical schema with every stats change made Steam reload it on each unlock
+// ("updated schema from server"); afterwards the achievement window showed 0%
+// for every global unlock rate until Steam restarted.
 CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<PB::Field>& reqBody) {
+    uint64_t steamId = 0;
+    if (auto* f = PB::FindField(reqBody, 1)) steamId = f->varintVal; // steamid
+    std::vector<uint8_t> clientSha;
+    if (auto* f = PB::FindField(reqBody, 3); f && f->wireType == PB::LengthDelimited && f->data)
+        clientSha.assign(f->data, f->data + f->dataLen);              // sha_schema
     uint32_t clientCrc = 0;
-    auto* crcField = PB::FindField(reqBody, 4); // crc_stats
-    if (crcField) clientCrc = (uint32_t)crcField->varintVal;
+    if (auto* f = PB::FindField(reqBody, 4)) clientCrc = (uint32_t)f->varintVal; // crc_stats
 
-    LOG("[Stats] GetUserStats app=%u clientCrc=%u", appId, clientCrc);
+    LOG("[Stats] GetUserStats app=%u clientCrc=%u clientSchema=%s",
+        appId, clientCrc, clientSha.empty() ? "none" : "sha");
 
     if (MetadataSync::syncAchievements.load(std::memory_order_relaxed)) {
         if (!StatsStore::WaitForSeed(10000))
             LOG("[Stats] GetUserStats app=%u: seed timed out after 10 s", appId);
+    }
+
+    // The store only holds the logged-in account's stats. Another player's
+    // request (a friend comparison, a game's RequestUserStats for someone else)
+    // goes to Steam instead of being answered with ours.
+    uint32_t storeAccount = StatsStore::GetDiskAccountId();
+    uint32_t requestAccount = (uint32_t)(steamId & 0xFFFFFFFFu);
+    if (requestAccount != 0 && storeAccount != 0 && requestAccount != storeAccount) {
+        LOG("[Stats] GetUserStats app=%u: request is for account %u, store holds %u; passing through",
+            appId, requestAccount, storeAccount);
+        return CloudIntercept::RpcResult();
     }
 
     // Snapshot: thread-safe copy taken under the store lock.
@@ -57,22 +82,37 @@ CloudIntercept::RpcResult HandleGetUserStats(uint32_t appId, const std::vector<P
         return CloudIntercept::RpcResult();
     }
 
+    // A hash failure leaves the client's copy unknown, so the schema goes out.
+    std::vector<uint8_t> sha = FileUtil::SHA1(stats.schema.data(), stats.schema.size());
+    bool shaKnown = sha.size() == 20;
+    bool sendSchema = !shaKnown || clientSha != sha;   // none, or a different one
+    // Client adopts stats only when our crc differs from its echoed crc.
+    bool sendStats = clientCrc != stats.crcStats;
+
     PB::Writer resp;
 
-    // Client adopts stats only when our crc differs from its echoed crc.
+    // Field 1: sha_schema (the schema the client holds after this response)
+    if (shaKnown) resp.WriteBytes(1, sha.data(), sha.size());
 
     // Field 2: crc_stats (always our authoritative token)
     resp.WriteVarint(2, stats.crcStats);
 
-    if (clientCrc == stats.crcStats) {
-        // Client already in sync with us -> no-op response (crc only).
-        LOG("[Stats]   app=%u up-to-date (crc=%u); sending crc-only no-op", appId, stats.crcStats);
+    if (!sendSchema && !sendStats) {
+        // Client already in sync with us -> no-op response.
+        LOG("[Stats]   app=%u up-to-date (crc=%u, same schema); sending no-op", appId, stats.crcStats);
         return CloudIntercept::RpcResult(std::move(resp));
     }
 
-    // Client stale -- send schema + stats (schema presence was checked above).
-    resp.WriteBytes(3, stats.schema.data(), stats.schema.size());
-    LOG("[Stats]   Sending schema (%zu bytes)", stats.schema.size());
+    if (sendSchema) {
+        resp.WriteBytes(3, stats.schema.data(), stats.schema.size());
+        LOG("[Stats]   Sending schema (%zu bytes): client schema %s", stats.schema.size(),
+            clientSha.empty() ? "missing" : "differs");
+    }
+
+    if (!sendStats) {
+        LOG("[Stats]   app=%u stats up-to-date (crc=%u); schema only", appId, stats.crcStats);
+        return CloudIntercept::RpcResult(std::move(resp));
+    }
 
     // Field 4: stats (repeated)
     for (auto& s : stats.stats) {

@@ -487,12 +487,15 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
 endif()
 
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
-# Pure-logic regression tests for the cross-device playtime merge. Kept outside
-# tests/ (gitignored upstream) so they are versioned and run by CI.
+# Pure-logic regression tests for the cross-device playtime merge and the
+# GetUserStats answer. Kept outside tests/ (gitignored upstream) so they are
+# versioned and run by CI.
 if(EXISTS ${CMAKE_SOURCE_DIR}/tests-fork/stats_store_fork_tests.cpp)
     add_executable(stats_store_fork_tests
         tests-fork/stats_store_fork_tests.cpp
         src/common/stats_store.cpp
+        src/common/stats_handlers.cpp
+        src/common/protobuf.cpp
         src/common/json.cpp
         src/common/metadata_sync.cpp
         src/common/vdf.cpp

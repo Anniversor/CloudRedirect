@@ -96,6 +96,9 @@ bool CR_HandleCloudRpc(const char* method, uint32_t appId,
     else if (strcmp(method, StatsHandlers::RPC_GET_USER_STATS) == 0 &&
              MetadataSync::syncAchievements.load(std::memory_order_relaxed)) {
         result = StatsHandlers::HandleGetUserStats(appId, fields);
+        // Empty body = not ours to answer (no schema yet, another account's
+        // stats): let the request reach Steam instead of an empty success.
+        if (result->body.Size() == 0) return false;
     }
     else if (strcmp(method, StatsHandlers::RPC_GET_LAST_PLAYED) == 0 &&
              MetadataSync::syncPlaytime.load(std::memory_order_relaxed)) {
