@@ -119,6 +119,7 @@ else()
         src/platform/linux/cloud_hooks.cpp
         src/platform/linux/cloud_intercept.cpp
         src/platform/linux/stats_hooks.cpp
+        src/platform/linux/stats_store_hook.cpp
         src/platform/linux/gamesplayed_hook.cpp
         src/platform/linux/live_playtime.cpp
         src/platform/linux/http_transport_linux.cpp

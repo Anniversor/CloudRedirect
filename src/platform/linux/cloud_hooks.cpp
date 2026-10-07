@@ -1,6 +1,7 @@
 #include "cloud_hooks.h"
 #include "cloud_intercept.h"
 #include "stats_hooks.h"
+#include "stats_store_hook.h"
 #include "gamesplayed_hook.h"
 #include "live_playtime.h"
 
@@ -261,6 +262,9 @@ void CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t st
     // already check the live toggle (matches Windows).
     GamesPlayedHook::SetSerializer(&SerializeBodyTL);
     GamesPlayedHook::Install(steamclientBase, steamclientSize);
+    StatsStoreHook::Install(steamclientBase, steamclientSize,
+        [](void* msg) { return SerializeMessage(msg); },
+        [](void* msg, const uint8_t* data, size_t len) { return ParseIntoMessage(msg, data, len); });
 
     if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray))
         LivePlaytime::InstallUserCapture();
@@ -933,6 +937,7 @@ extern "C" bool hook_IsCloudEnabledForApp(void* pThis, unsigned int appId)
 void CloudHooks::BeginShutdown() {
     g_shuttingDown.store(true, std::memory_order_release);
     GamesPlayedHook::Remove();
+    StatsStoreHook::Remove();
     if (g_statsSyncEnabled.load(std::memory_order_relaxed)) {
         LivePlaytime::DrainOnNetThread();
     }

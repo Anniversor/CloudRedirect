@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <mutex>
 #include <functional>
+#include <optional>
 
 namespace StatsStore {
 
@@ -159,6 +160,12 @@ uint32_t SetStat(uint32_t appId, uint32_t statId, uint32_t value);
 
 // Returns the new CRC.
 uint32_t SetStats(uint32_t appId, const std::vector<StatEntry>& entries);
+
+// Commit a client's stats delta durably before acknowledging StoreStats. Does
+// not contact the cloud on the calling (Steam job) thread. Returns no CRC on
+// disk failure, leaving the previous in-memory state intact.
+std::optional<uint32_t> CommitClientStats(uint32_t appId,
+    const std::vector<StatEntry>& entries, bool explicitReset, uint32_t accountId);
 
 // Returns the new CRC.
 uint32_t SetAchievement(uint32_t appId, uint32_t statId, uint32_t bit, uint32_t unlockTime);

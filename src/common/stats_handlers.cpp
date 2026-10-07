@@ -294,19 +294,29 @@ std::optional<std::vector<uint8_t>> HandleLegacyGetUserStats(
     return out;
 }
 
-// Legacy EMsg 820: CMsgClientStoreUserStats2. Response is EMsg 821.
+// CMsgClientStoreUserStats2 (5466; legacy 820). Response is EMsg 821.
 std::optional<std::vector<uint8_t>> HandleLegacyStoreUserStats2(
     const uint8_t* body, size_t bodyLen, uint64_t steamId) {
-    (void)steamId;
+    if (!MetadataSync::syncAchievements.load(std::memory_order_relaxed)) return std::nullopt;
 
     auto fields = PB::Parse(body, bodyLen);
 
     uint64_t gameId = 0;
     auto* f1 = PB::FindField(fields, 1);
-    if (f1) gameId = f1->varintVal;
+    if (f1 && f1->wireType == PB::Fixed64) gameId = f1->varintVal;
 
     uint32_t appId = (uint32_t)(gameId & 0xFFFFFF);
-    if (appId == 0) return std::nullopt;
+    if (appId == 0 || gameId != appId || !IsNamespaceApp(appId)) return std::nullopt;
+    const uint32_t account = StatsStore::GetDiskAccountId();
+    if (!account || !steamId || uint32_t(steamId) != account) return std::nullopt;
+    // Never acknowledge another user's writes using our account's store.
+    for (uint32_t id : {2u, 3u}) {
+        auto* f = PB::FindField(fields, id);
+        if (!f || f->wireType != PB::Fixed64 || f->varintVal != steamId) return std::nullopt;
+    }
+    // Match the read handler's authority: without a schema, reads still go to
+    // Steam and so must writes. We cannot identify new achievement bitfields.
+    if (StatsStore::Snapshot(appId).schema.empty()) return std::nullopt;
 
     bool explicitReset = false;
     auto* f5 = PB::FindField(fields, 5);
@@ -315,10 +325,6 @@ std::optional<std::vector<uint8_t>> HandleLegacyStoreUserStats2(
     LOG("[Stats] Legacy StoreUserStats2 app=%u gameId=%llu reset=%d ns=%d",
         appId, (unsigned long long)gameId, explicitReset, IsNamespaceApp(appId) ? 1 : 0);
 
-    if (explicitReset) {
-        StatsStore::ResetStats(appId);   // clears stats/achievements under the store lock
-    }
-
     std::vector<StatsStore::StatEntry> entries;
     for (auto& f : fields) {
         if (f.fieldNum == 6 && f.wireType == PB::LengthDelimited) {
@@ -326,21 +332,23 @@ std::optional<std::vector<uint8_t>> HandleLegacyStoreUserStats2(
             uint32_t statId = 0, statVal = 0;
             auto* sid = PB::FindField(sub, 1);
             auto* sval = PB::FindField(sub, 2);
-            if (sid) statId = (uint32_t)sid->varintVal;
-            if (sval) statVal = (uint32_t)sval->varintVal;
+            if (!sid || !sval || sid->wireType != PB::Varint || sval->wireType != PB::Varint)
+                return std::nullopt;
+            statId = (uint32_t)sid->varintVal;
+            statVal = (uint32_t)sval->varintVal;
             entries.push_back({statId, statVal});
         }
     }
 
-    uint32_t newCrc = StatsStore::SetStats(appId, entries);
-    LOG("[Stats]   Stored %zu stats, newCrc=%u", entries.size(), newCrc);
+    auto newCrc = StatsStore::CommitClientStats(appId, entries, explicitReset, account);
+    LOG("[Stats]   Local commit app=%u stats=%zu persisted=%d crc=%u",
+        appId, entries.size(), newCrc.has_value(), newCrc.value_or(0));
 
     PB::Writer resp;
     resp.WriteFixed64(1, gameId);       // game_id
-    resp.WriteVarint(2, 1);             // eresult = OK
-    resp.WriteVarint(3, newCrc);        // crc_stats
-
-    StatsStore::FlushAll();
+    resp.WriteVarint(2, newCrc ? 1 : 2); // OK only after durable local commit
+    if (newCrc) resp.WriteVarint(3, *newCrc);
+    resp.WriteVarint(5, 0);             // stats_out_of_date: local store is authoritative
 
     return resp.Data();
 }

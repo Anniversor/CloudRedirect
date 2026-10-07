@@ -522,6 +522,135 @@ static void UserStatsOtherAccountPassesThrough() {
     CHECK(unnamed.stats == 1);
 }
 
+static PB::Writer StoreRequest(uint64_t account = kStatsSteamId, bool reset = false) {
+    PB::Writer req, stat;
+    req.WriteFixed64(1, kStatsApp);
+    req.WriteFixed64(2, kStatsSteamId);
+    req.WriteFixed64(3, account);
+    req.WriteVarint(4, 0xdeadbeef); // the old server token is not our authority
+    req.WriteVarint(5, reset);
+    stat.WriteVarint(1, 1);
+    stat.WriteVarint(2, 7);
+    req.WriteSubmessage(6, stat);
+    return req;
+}
+
+static void StoreReplyEndsOutOfDateLoop() {
+    SetUpStatsStore(10, true);
+    StatsHandlers::SetNamespacePredicate([](uint32_t app) { return app == kStatsApp; });
+    MetadataSync::syncAchievements.store(true);
+    auto req = StoreRequest();
+    auto response = StatsHandlers::HandleLegacyStoreUserStats2(
+        req.Data().data(), req.Size(), kStatsSteamId);
+    CHECK(response.has_value());
+    if (!response) return;
+    const auto fields = PB::Parse(response->data(), response->size());
+    CHECK(PB::FindField(fields, 2)->varintVal == 1);
+    CHECK(PB::FindField(fields, 5)->varintVal == 0);
+    const uint32_t crc = uint32_t(PB::FindField(fields, 3)->varintVal);
+    auto saved = StatsStore::Snapshot(kStatsApp);
+    CHECK(saved.crcStats == crc);
+    CHECK(saved.stats[0].value == 7);
+    CHECK(saved.achievements[0].bits == 7);
+    CHECK(saved.achievements[0].unlockTimes[0] == 1759600000);
+    CHECK(saved.achievements[0].unlockTimes[2] != 0);
+    StatsStore::AppStats disk{};
+    CHECK(StatsStore::LoadAppStats(kStatsApp, disk));
+    CHECK(disk.crcStats == crc);
+    CHECK(disk.achievements[0].unlockTimes[2] == saved.achievements[0].unlockTimes[2]);
+    // Retrying the same transaction must not change unlock times / CRC.
+    auto again = StatsHandlers::HandleLegacyStoreUserStats2(req.Data().data(), req.Size(), kStatsSteamId);
+    CHECK(again == response);
+    MetadataSync::syncAchievements.store(false); // skip seed wait in read fixture
+    auto read = AskUserStats(kStatsSteamId, &kSchemaSha, crc);
+    CHECK(read.answered && read.crc == crc && read.stats == 0 && !read.hasSchema);
+}
+
+static void StoreRejectsUnmanagedAndOtherAccounts() {
+    const auto old = SetUpStatsStore(11, true);
+    auto req = StoreRequest();
+    auto send = [&](const PB::Writer& q) {
+        return StatsHandlers::HandleLegacyStoreUserStats2(q.Data().data(), q.Size(), kStatsSteamId);
+    };
+    MetadataSync::syncAchievements.store(false);
+    CHECK(!send(req));
+    MetadataSync::syncAchievements.store(true);
+    StatsHandlers::SetNamespacePredicate([](uint32_t) { return false; });
+    CHECK(!send(req));
+    StatsHandlers::SetNamespacePredicate([](uint32_t app) { return app == kStatsApp; });
+    CHECK(!send(StoreRequest(kStatsSteamId + 1)));
+    PB::Writer malformed = StoreRequest();
+    PB::Writer invalidStat;
+    invalidStat.WriteVarint(1, 9); // missing value: no partial mutation
+    malformed.WriteSubmessage(6, invalidStat);
+    CHECK(!send(malformed));
+    CHECK(StatsStore::Snapshot(kStatsApp).crcStats == old);
+    MetadataSync::syncAchievements.store(false);
+}
+
+static void StoreDiskFailureIsNotAcknowledged() {
+    const uint32_t before = SetUpStatsStore(12, true);
+    const auto root = g_tempRoots.back();
+    const auto path = root / "cloud" / "stats" / std::to_string(kStatsAccount)
+                     / (std::to_string(kStatsApp) + ".json");
+    if (std::filesystem::exists(path)) std::filesystem::rename(path, path.string() + ".saved");
+    std::filesystem::create_directory(path); // directory is never replaceable by atomic file rename
+    MetadataSync::syncAchievements.store(true);
+    auto req = StoreRequest();
+    auto response = StatsHandlers::HandleLegacyStoreUserStats2(req.Data().data(), req.Size(), kStatsSteamId);
+    CHECK(response.has_value());
+    if (response) {
+        auto fields = PB::Parse(response->data(), response->size());
+        CHECK(PB::FindField(fields, 2)->varintVal == 2);
+        CHECK(!PB::FindField(fields, 3));
+    }
+    CHECK(StatsStore::Snapshot(kStatsApp).crcStats == before);
+    MetadataSync::syncAchievements.store(false);
+}
+
+static void StoreResetKeepsSchemaAndPlaytime() {
+    SetUpStatsStore(13, true);
+    auto before = StatsStore::Snapshot(kStatsApp);
+    auto crc = StatsStore::CommitClientStats(kStatsApp, {}, true, kStatsAccount);
+    CHECK(crc && *crc == 0);
+    auto after = StatsStore::Snapshot(kStatsApp);
+    CHECK(after.stats.empty() && after.achievements.empty());
+    CHECK(after.schema == before.schema);
+    CHECK(after.playtime.minutesForever == before.playtime.minutesForever);
+}
+
+static void StoreFirstUnlockUsesSchemaAndPreservesNumericStats() {
+    SetUpStatsStore(14, false);
+    std::vector<uint8_t> schema;
+    auto field = [&](uint8_t type, const std::string& name) {
+        schema.push_back(type);
+        schema.insert(schema.end(), name.begin(), name.end());
+        schema.push_back(0);
+    };
+    field(0, std::to_string(kStatsApp)); field(0, "stats"); field(0, "3");
+    field(0, "bits"); field(0, "0"); field(1, "name");
+    const std::string name = "PROLOGUE_COMPLETE";
+    schema.insert(schema.end(), name.begin(), name.end()); schema.push_back(0);
+    for (int i = 0; i < 6; ++i) schema.push_back(8);
+    StatsStore::SetSchema(kStatsApp, schema.data(), schema.size());
+    CHECK(!StatsStore::CommitClientStats(kStatsApp, {{3, 1}}, false, kStatsAccount + 1));
+    auto crc = StatsStore::CommitClientStats(kStatsApp, {{3, 1}, {99, 123}}, false, kStatsAccount);
+    CHECK(crc.has_value());
+    auto saved = StatsStore::Snapshot(kStatsApp);
+    CHECK(saved.achievements.size() == 1);
+    CHECK(saved.achievements[0].statId == 3);
+    CHECK(saved.achievements[0].names[0] == name);
+    CHECK(saved.achievements[0].unlockTimes[0] != 0);
+    CHECK(saved.stats.size() == 2 && saved.stats[1].value == 123);
+    auto nextCrc = StatsStore::CommitClientStats(kStatsApp, {{99, 5}}, false, kStatsAccount);
+    CHECK(nextCrc && *nextCrc != *crc);
+    CHECK(StatsStore::Snapshot(kStatsApp).stats[1].value == 5); // genuine numeric decreases remain valid
+    StatsStore::AppStats disk{};
+    CHECK(StatsStore::LoadAppStats(kStatsApp, disk));
+    CHECK(disk.schema == schema);
+    CHECK(disk.achievements[0].unlockTimes[0] == saved.achievements[0].unlockTimes[0]);
+}
+
 int main() {
     ReconcileKeepsOtherDevicesMinutes();
     ReconcileAddsShortfallToOwnField();
@@ -547,6 +676,11 @@ int main() {
     UserStatsZeroCrcStillSendsSchema();
     UserStatsDifferentSchemaIsReplaced();
     UserStatsOtherAccountPassesThrough();
+    StoreReplyEndsOutOfDateLoop();
+    StoreRejectsUnmanagedAndOtherAccounts();
+    StoreDiskFailureIsNotAcknowledged();
+    StoreResetKeepsSchemaAndPlaytime();
+    StoreFirstUnlockUsesSchemaAndPreservesNumericStats();
     for (const auto& root : g_tempRoots) {
         std::error_code ec;
         std::filesystem::remove_all(root, ec);

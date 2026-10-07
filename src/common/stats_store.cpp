@@ -2358,6 +2358,77 @@ uint32_t SetStats(uint32_t appId, const std::vector<StatEntry>& entries) {
     return stats.crcStats;
 }
 
+std::optional<uint32_t> CommitClientStats(uint32_t appId,
+    const std::vector<StatEntry>& entries, bool explicitReset, uint32_t accountId) {
+    uint32_t crc;
+    {
+        std::lock_guard<std::mutex> lock(g_mutex);
+        if (!accountId || accountId != g_diskAccountId || !g_accountIdProvider ||
+            g_accountIdProvider() != g_diskAccountId) return std::nullopt;
+        AppStats& current = GetOrCreateLocked(appId);
+        AppStats next = current;
+        if (explicitReset) {
+            next.stats.clear();
+            next.achievements.clear();
+        }
+        std::vector<BkvNode> schema;
+        size_t pos = 0, nodes = 0;
+        std::unordered_map<uint64_t, std::string> names;
+        std::unordered_map<uint32_t, StatMerge> methods;
+        if (!next.schema.empty() && BkvRead(next.schema.data(), next.schema.size(),
+                                           pos, schema, 0, nodes)) {
+            names = ParseSchemaAchievementNames(schema);
+            methods = ParseSchemaMergeMethods(schema);
+        }
+        const uint32_t now = NowUnix();
+        for (const auto& entry : entries) {
+            auto stat = std::find_if(next.stats.begin(), next.stats.end(),
+                [&](const StatEntry& s) { return s.statId == entry.statId; });
+            if (stat == next.stats.end()) {
+                next.stats.push_back(entry);
+                stat = std::prev(next.stats.end());
+                if (auto m = methods.find(entry.statId); m != methods.end()) stat->merge = m->second;
+            } else {
+                stat->value = entry.value;
+            }
+            auto ach = std::find_if(next.achievements.begin(), next.achievements.end(),
+                [&](const AchievementBlock& a) { return a.statId == entry.statId; });
+            bool achievement = ach != next.achievements.end();
+            for (const auto& [key, name] : names)
+                if (uint32_t(key >> 32) == entry.statId) achievement = true;
+            if (!achievement) continue;
+            if (ach == next.achievements.end()) {
+                next.achievements.push_back({});
+                ach = std::prev(next.achievements.end());
+                ach->statId = entry.statId;
+            }
+            // Keep the existing monotonic cross-device achievement merge.
+            ach->bits |= entry.value;
+            stat->value |= ach->bits;
+            for (uint32_t bit = 0; bit < 32; ++bit) {
+                if ((ach->bits & (1u << bit)) && !ach->unlockTimes[bit])
+                    ach->unlockTimes[bit] = now;
+                if (auto n = names.find((uint64_t(entry.statId) << 32) | bit); n != names.end())
+                    ach->names[bit] = n->second;
+            }
+        }
+        crc = next.crcStats = ComputeCrcLocked(next);
+        const std::string json = BuildAppStatsJson(next);
+        // ACK only after durable local storage. Never export an old native blob
+        // over Steam's live pending changes; Steam consumes our ACK itself.
+        if (!next.schema.empty() && !FileUtil::AtomicWriteBinary(SchemaPath(appId),
+            next.schema.data(), next.schema.size())) return std::nullopt;
+        if (!FileUtil::AtomicWriteText(StatsPath(appId), json)) return std::nullopt;
+        current = std::move(next);
+        g_dirty[appId] = false;
+        if (explicitReset) g_resetApps.insert(appId);
+        g_cloudBlobByApp[appId] = json;
+        g_accountBlobDirty = true;
+    }
+    PushAccountBlobIfDirty();
+    return crc;
+}
+
 uint32_t SetAchievement(uint32_t appId, uint32_t statId, uint32_t bit, uint32_t unlockTime) {
     std::lock_guard<std::mutex> lock(g_mutex);
     AppStats& stats = GetOrCreateLocked(appId);   // seed before mutate+push
