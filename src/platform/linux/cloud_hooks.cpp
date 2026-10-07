@@ -262,9 +262,10 @@ void CloudHooks::InstallGamesPlayedObserver(uintptr_t steamclientBase, size_t st
     // already check the live toggle (matches Windows).
     GamesPlayedHook::SetSerializer(&SerializeBodyTL);
     GamesPlayedHook::Install(steamclientBase, steamclientSize);
-    StatsStoreHook::Install(steamclientBase, steamclientSize,
+    if (!StatsStoreHook::Install(steamclientBase, steamclientSize,
         [](void* msg) { return SerializeMessage(msg); },
-        [](void* msg, const uint8_t* data, size_t len) { return ParseIntoMessage(msg, data, len); });
+        [](void* msg, const uint8_t* data, size_t len) { return ParseIntoMessage(msg, data, len); }))
+        LOG("[Stats] WARNING: local StoreUserStats hook is inactive; see installation diagnostic above");
 
     if (LivePlaytime::Resolve(steamclientBase, steamclientSize, g_parseFromArray))
         LivePlaytime::InstallUserCapture();

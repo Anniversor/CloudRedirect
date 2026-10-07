@@ -488,6 +488,23 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
 endif()
 
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
+if(NOT WIN32 AND (LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
+    add_library(sls_hook_fixture SHARED tests-fork/sls_hook_fixture.cpp)
+    set_target_properties(sls_hook_fixture PROPERTIES PREFIX "" OUTPUT_NAME "SLSsteam"
+        LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/hook-test-fixture")
+    add_executable(stats_store_hook_tests tests-fork/stats_store_hook_tests.cpp)
+    target_include_directories(stats_store_hook_tests PRIVATE src/common src/platform/linux)
+    target_link_libraries(stats_store_hook_tests PRIVATE dl pthread)
+    if(LINUX_32BIT)
+        foreach(test_target sls_hook_fixture stats_store_hook_tests)
+            target_compile_options(${test_target} PRIVATE -m32)
+            target_link_options(${test_target} PRIVATE -m32)
+        endforeach()
+    endif()
+    add_dependencies(stats_store_hook_tests sls_hook_fixture)
+    add_test(NAME stats_store_hook_tests COMMAND stats_store_hook_tests $<TARGET_FILE:sls_hook_fixture>)
+endif()
+
 # Pure-logic regression tests for the cross-device playtime merge and the
 # GetUserStats answer. Kept outside tests/ (gitignored upstream) so they are
 # versioned and run by CI.

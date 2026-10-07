@@ -1,9 +1,14 @@
 #include "stats_store_hook.h"
+#include "stats_store_hook_validation.h"
 #include "stats_handlers.h"
 #include "cloud_intercept.h"
 #include "log.h"
 #include <atomic>
 #include <cstring>
+#include <cstdio>
+#include <cinttypes>
+#include <cerrno>
+#include <string>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -57,10 +62,39 @@ static bool Writable(uint8_t* p) {
                     PROT_READ | PROT_WRITE | PROT_EXEC) == 0;
 }
 
+static bool IsSlsExecutable(uint32_t address) {
+    // SLSsteam detours CAPIJob_SendAndRecv before CR initializes. Accept that
+    // known chain only; an arbitrary JMP or an unmapped destination is not
+    // evidence of a compatible function. Read mappings, never jump-target bytes.
+    FILE* maps = fopen("/proc/self/maps", "r");
+    if (!maps) return false;
+    char line[2048];
+    bool valid = false;
+    while (fgets(line, sizeof(line), maps)) {
+        uintptr_t begin = 0, end = 0;
+        char permissions[5] = {};
+        int pathStart = 0;
+        if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR " %4s %*s %*s %*s %n",
+                   &begin, &end, permissions, &pathStart) != 3 || pathStart <= 0)
+            continue;
+        if (address < begin || address >= end) continue;
+        std::string path(line + pathStart);
+        while (!path.empty() && (path.back() == '\n' || path.back() == '\r')) path.pop_back();
+        valid = Validation::IsSlsMapping(permissions, path);
+        break;
+    }
+    fclose(maps);
+    return valid;
+}
+
 bool Install(uintptr_t base, size_t size, StatsHooks::SerializeFn serialize,
              StatsHooks::ParseFn parse) {
     if (g_call) return true;
-    if (!serialize || !parse || sizeof(void*) != 4) return false;
+    if (!serialize || !parse || sizeof(void*) != 4) {
+        LOG("[Stats] StoreUserStats hook unavailable: serializer=%d parser=%d pointer_size=%zu",
+            bool(serialize), bool(parse), sizeof(void*));
+        return false;
+    }
     // push 821; push edi(reply); push 10; add eax,184h(request);
     // push 1; push eax; push [ebp+8](job); call SendAndWait;
     // mov ecx,eax; mov [ebp-local],al; mov eax,[ebp+8]; add esp,20h.
@@ -90,7 +124,24 @@ bool Install(uintptr_t base, size_t size, StatsHooks::SerializeFn serialize,
     memcpy(&rel, found + 1, 4);
     auto* target = found + 5 + rel;
     if (uintptr_t(target) < base || uintptr_t(target) >= base + size ||
-        memcmp(target, "\x55\x57\x56\x53\xe8", 5) || !Writable(found)) return false;
+        base + size - uintptr_t(target) < 5) {
+        LOG("[Stats] StoreUserStats hook skipped: target %p outside Steam image", target);
+        return false;
+    }
+    const auto kind = Validation::ClassifyEntry(uint32_t(uintptr_t(target)), target, 5,
+                                               &IsSlsExecutable);
+    if (kind == Validation::EntryKind::Unsupported) {
+        LOG("[Stats] StoreUserStats hook skipped: unsupported target %p bytes=%02x %02x %02x %02x %02x",
+            target, target[0], target[1], target[2], target[3], target[4]);
+        return false;
+    }
+    if (!Writable(found)) {
+        LOG("[Stats] StoreUserStats hook skipped: mprotect failed at %p (errno=%d)", found, errno);
+        return false;
+    }
+    // Preserve the original ENTRY, including SLSsteam's detour. Unmanaged and
+    // disabled requests must still traverse its hook; do not bypass its chain
+    // by jumping to the SLS destination or trying to reconstruct its trampoline.
     g_original = reinterpret_cast<SendWait>(target);
     g_serialize = std::move(serialize);
     g_parse = std::move(parse);
@@ -100,7 +151,8 @@ bool Install(uintptr_t base, size_t size, StatsHooks::SerializeFn serialize,
     memcpy(found + 1, &rel, 4);
     __builtin___clear_cache(reinterpret_cast<char*>(found), reinterpret_cast<char*>(found + 5));
     g_call = found;
-    LOG("[Stats] StoreUserStats local commit hook installed at %p", found);
+    LOG("[Stats] StoreUserStats local commit hook installed at %p (target=%p, chain=%s)",
+        found, target, kind == Validation::EntryKind::SlsDetour ? "SLSsteam" : "native");
     return true;
 }
 
