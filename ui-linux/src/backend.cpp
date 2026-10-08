@@ -1,4 +1,5 @@
 #include "backend.h"
+#include "flatpak_update_check.h"
 #include "utils.h"
 #include <QDir>
 #include <QFile>
@@ -2026,67 +2027,39 @@ void Backend::dismissAutoUpdatePrompt()
     }
 }
 
-static QString runFlatpakHostCommand(const QStringList &args, int timeoutMs = 15000)
-{
-    QProcess proc;
-    if (QFile::exists("/.flatpak-info")) {
-        proc.start("flatpak-spawn", QStringList{"--host", "flatpak"} + args);
-    } else {
-        proc.start("flatpak", args);
-    }
-    proc.waitForFinished(timeoutMs);
-    return proc.readAllStandardOutput();
-}
-
 void Backend::checkForFlatpakUpdate()
 {
-    // Only relevant inside or alongside a Flatpak install
-    QString remotes = runFlatpakHostCommand({"remote-list", "--user", "--columns=name"});
-    if (!remotes.contains("cloudredirect"))
-        return;
-
-    // Get remote version and compare against running version
-    QString info = runFlatpakHostCommand({"remote-info", "--user", "cloudredirect", "org.cloudredirect.CloudRedirect"});
-    QString remoteVersion;
-    for (const QString &line : info.split('\n')) {
-        if (line.trimmed().startsWith("Version:")) {
-            remoteVersion = line.mid(line.indexOf(':') + 1).trimmed();
-            break;
-        }
-    }
-
-    if (remoteVersion.isEmpty())
-        return;
-
-    // Compare versions: only notify if remote is strictly newer
-    QString current = QCoreApplication::applicationVersion();
-    auto parseVer = [](const QString &v) -> QList<int> {
-        // Strip the build id ("+1a2b3c4") and any prerelease suffix ("-TEST4").
-        // Fork releases carry a fourth component (2.6.5.4 is newer than 2.6.5).
-        QString base = v.section('+', 0, 0).section('-', 0, 0);
-        QList<int> parts;
-        for (const QString &p : base.split('.'))
-            parts.append(p.toInt());
-        while (parts.size() < 4) parts.append(0);
-        return parts;
-    };
-    QList<int> rv = parseVer(remoteVersion);
-    QList<int> cv = parseVer(current);
-    bool remoteNewer = false;
-    for (int i = 0; i < 4; ++i) {
-        if (rv[i] > cv[i]) { remoteNewer = true; break; }
-        if (rv[i] < cv[i]) break;
-    }
-
-    if (remoteNewer)
-        emit flatpakUpdateAvailable();
+    if (m_flatpakUpdateCheckRunning || m_flatpakUpdateRunning) return;
+    m_flatpakUpdateCheckRunning = true;
+    FlatpakUpdateCheck::Options options;
+    options.sandboxed = QFile::exists("/.flatpak-info");
+    FlatpakUpdateCheck::Check(this, QCoreApplication::applicationVersion(), options,
+        [this](FlatpakUpdateCheck::Result result) {
+            m_flatpakUpdateCheckRunning = false;
+            if (result.status == FlatpakUpdateCheck::Status::Available) {
+                fprintf(stderr, "[Backend] Flatpak update available: %s\n", result.remoteVersion.toUtf8().constData());
+                emit flatpakUpdateAvailable();
+            } else if (result.status == FlatpakUpdateCheck::Status::UpToDate) {
+                fprintf(stderr, "[Backend] Flatpak update check complete: remote=%s, app is up to date\n",
+                    result.remoteVersion.toUtf8().constData());
+            } else if (result.status == FlatpakUpdateCheck::Status::Failed) {
+                fprintf(stderr, "[Backend] Flatpak update check failed: %s\n", result.error.toUtf8().constData());
+            }
+        });
 }
 
 void Backend::applyFlatpakUpdate()
 {
-    QString output = runFlatpakHostCommand({"update", "--user", "-y", "org.cloudredirect.CloudRedirect"}, 120000);
-    bool ok = (output.contains("org.cloudredirect.CloudRedirect") && !output.contains("error:"));
-    emit flatpakUpdateCompleted(ok);
+    if (m_flatpakUpdateRunning) return;
+    m_flatpakUpdateRunning = true;
+    FlatpakUpdateCheck::Options options;
+    options.sandboxed = QFile::exists("/.flatpak-info");
+    options.timeoutMs = 120000;
+    FlatpakUpdateCheck::Apply(this, options, [this](bool ok, QString error) {
+        m_flatpakUpdateRunning = false;
+        if (!ok) fprintf(stderr, "[Backend] Flatpak update failed: %s\n", error.toUtf8().constData());
+        emit flatpakUpdateCompleted(ok);
+    });
 }
 
 // ── Cloud provider migration ────────────────────────────────────────────

@@ -12,6 +12,8 @@ class QProcess;
 class Backend : public QObject
 {
     Q_OBJECT
+    bool m_flatpakUpdateCheckRunning = false;
+    bool m_flatpakUpdateRunning = false;
 
     Q_PROPERTY(int managedAppCount READ managedAppCount NOTIFY appsChanged)
     Q_PROPERTY(int remoteOnlyAppCount READ remoteOnlyAppCount NOTIFY appsChanged)

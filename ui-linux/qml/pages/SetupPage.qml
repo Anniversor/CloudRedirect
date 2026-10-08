@@ -231,7 +231,10 @@ Page {
 
                 Button {
                     text: "Refresh"
-                    onClicked: { if (deployer) deployer.checkPrerequisites() }
+                    onClicked: {
+                        if (deployer) deployer.checkPrerequisites()
+                        if (backend) backend.checkForFlatpakUpdate()
+                    }
                 }
             }
 

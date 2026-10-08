@@ -42,7 +42,23 @@ ApplicationWindow {
         function onFlatpakUpdateCompleted(success) {
             if (success) {
                 restartDialog.open()
+            } else {
+                updateFailedDialog.open()
             }
+        }
+    }
+
+    Dialog {
+        id: updateFailedDialog
+        title: "Update Failed"
+        modal: true
+        standardButtons: Dialog.Ok
+        anchors.centerIn: parent
+        width: Math.min(parent.width - 80, 440)
+        Label {
+            width: parent.width
+            text: "CloudRedirect could not be updated. Check your connection and try again."
+            wrapMode: Text.WordWrap
         }
     }
 

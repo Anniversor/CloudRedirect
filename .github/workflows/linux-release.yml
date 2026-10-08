@@ -32,6 +32,20 @@ env:
   PAGES_URL: https://anniversor.github.io/CloudRedirect
 
 jobs:
+  ui_update_tests:
+    name: Flatpak update checker regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Qt Core development files
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq qt6-base-dev
+      - name: Build and test asynchronous update checks
+        run: |
+          set -e
+          cmake -S ui-linux/tests-fork -B build-ui-update-tests
+          cmake --build build-ui-update-tests -j"$(nproc)"
+          ctest --test-dir build-ui-update-tests --output-on-failure
+
   native:
     name: Native 32-bit (Ubuntu 20.04, glibc 2.31)
     runs-on: ubuntu-latest
@@ -168,7 +182,7 @@ jobs:
 
   flatpak:
     name: Flatpak (KDE Platform 6.10)
-    needs: native
+    needs: [native, ui_update_tests]
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:kde-6.10

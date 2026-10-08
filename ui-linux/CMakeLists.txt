@@ -50,6 +50,7 @@ find_package(Qt6 REQUIRED COMPONENTS Core Quick QuickControls2 DBus Network)
 qt_add_executable(cloud-redirect-ui
     src/main.cpp
     src/backend.cpp
+    src/flatpak_update_check.cpp
     src/deployer.cpp
     src/oauthservice.cpp
 )
