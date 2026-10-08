@@ -519,6 +519,7 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
 
             const auto* excludes = FindChild(entry.children, "exclude");
             if (excludes) {
+                rule.filterFields.push_back(*excludes);
                 if (excludes->hasString && !excludes->stringValue.empty()) {
                     rule.excludes.push_back(excludes->stringValue);
                 }
@@ -530,6 +531,7 @@ static std::vector<AutoCloudRuleNative> LoadAutoCloudRules(const std::string& st
             }
 
             const auto* siblings = FindChild(entry.children, "siblings");
+            if (siblings) rule.filterFields.push_back(*siblings);
             if (siblings && siblings->hasString && !siblings->stringValue.empty()) {
                 rule.siblings = ParseAutoCloudSiblings(siblings->stringValue);
                 if (rule.siblings.size() > 32) {

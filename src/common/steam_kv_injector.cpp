@@ -1,4 +1,5 @@
 #include "steam_kv_injector.h"
+#include "autocloud_injection.h"
 #include "log.h"
 
 #include <atomic>
@@ -319,6 +320,10 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
         // Create numbered subsection: savefiles/"0", savefiles/"1", etc.
         void* entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
         if (!entry) continue;
+
+        // Keep filters intact before making this rule usable by Steam.
+        if (!WriteFilterFields(entry, rule.filterFields, g_r.kvFindKey,
+                               g_r.kvSetString, g_r.kvSetInt)) return false;
 
         // Set root
         void* rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
@@ -977,6 +982,9 @@ bool InjectSaveFiles(uint32_t appId, const std::vector<SaveFileRule>& rules) {
 
         void* entry = g_r.kvFindKey(savefiles, idxStr.c_str(), 1, nullptr);
         if (!entry) continue;
+
+        if (!WriteFilterFields(entry, rule.filterFields, g_r.kvFindKey,
+                               g_r.kvSetString, g_r.kvSetInt32)) return false;
 
         void* rootKv = g_r.kvFindKey(entry, "root", 1, nullptr);
         if (rootKv) g_r.kvSetString(rootKv, rule.root.c_str());

@@ -99,9 +99,11 @@ jobs:
       - name: Build and run fork unit tests
         shell: pwsh
         run: |
-          cmake --build build --config Release --target stats_store_fork_tests
+          cmake --build build --config Release --target stats_store_fork_tests autocloud_injection_tests
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           & build/Release/stats_store_fork_tests.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          & build/Release/autocloud_injection_tests.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Build native x86 (cloud760_tool.exe)

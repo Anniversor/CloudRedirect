@@ -488,6 +488,19 @@ if(EXISTS ${CMAKE_SOURCE_DIR}/tests/pending_ops_journal_tests.cpp
 endif()
 
 # ── Fork tests (tests-fork/) ────────────────────────────────────────────
+add_executable(autocloud_injection_tests tests-fork/autocloud_injection_tests.cpp)
+target_include_directories(autocloud_injection_tests PRIVATE src/common)
+if(WIN32)
+    target_include_directories(autocloud_injection_tests PRIVATE src/platform/win)
+else()
+    target_include_directories(autocloud_injection_tests PRIVATE src/platform/linux)
+    if(LINUX_32BIT)
+        target_compile_options(autocloud_injection_tests PRIVATE -m32)
+        target_link_options(autocloud_injection_tests PRIVATE -m32)
+    endif()
+endif()
+add_test(NAME autocloud_injection_tests COMMAND autocloud_injection_tests)
+
 if(NOT WIN32 AND (LINUX_32BIT OR CMAKE_SIZEOF_VOID_P EQUAL 4))
     add_library(sls_hook_fixture SHARED tests-fork/sls_hook_fixture.cpp)
     set_target_properties(sls_hook_fixture PROPERTIES PREFIX "" OUTPUT_NAME "SLSsteam"

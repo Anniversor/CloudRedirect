@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include "autocloud_util.h"
 
 namespace SteamKvInjector {
 
@@ -44,6 +45,7 @@ struct SaveFileRule {
     std::string pattern;    // e.g. "*.zero"
     bool recursive = false;
     uint32_t platforms = 0xFFFFFFFFu;  // bitmask: Win=1, Mac=2, Linux=8; -1=all
+    std::vector<AutoCloudUtil::AppInfoKVNode> filterFields;
 };
 
 // Inject savefiles rules into UFS KV. Won't clobber existing children.

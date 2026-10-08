@@ -1,6 +1,7 @@
 #include "rpc_handlers.h"
 #include "metadata_sync.h"
 #include "autocloud_scan.h"
+#include "autocloud_injection.h"
 #include "autocloud_util.h"
 #include "batch_tracker.h"
 #include "cloud_intercept.h"
@@ -309,13 +310,7 @@ static void EnsureSaveFilesInjected(uint32_t appId) {
     std::vector<SteamKvInjector::SaveFileRule> kvRules;
     kvRules.reserve(rules.size());
     for (const auto& r : rules) {
-        SteamKvInjector::SaveFileRule sr;
-        sr.root = r.root;
-        sr.path = r.path;
-        sr.pattern = r.pattern;
-        sr.recursive = r.recursive;
-        sr.platforms = r.platforms;
-        kvRules.push_back(std::move(sr));
+        kvRules.push_back(SteamKvInjector::MakeSaveFileRule(r));
     }
 
     if (SteamKvInjector::InjectSaveFiles(appId, kvRules)) {

@@ -163,6 +163,15 @@ inline std::string ReadCStringFromBytes(const std::vector<uint8_t>& data, size_t
 
 // AutoCloud rule structures
 
+struct AppInfoKVNode {
+    std::string key;
+    std::string stringValue;
+    int32_t intValue = 0;
+    bool hasString = false;
+    bool hasInt = false;
+    std::vector<AppInfoKVNode> children;
+};
+
 struct AutoCloudRuleNative {
     std::string root;
     std::string cloudRoot;
@@ -175,6 +184,9 @@ struct AutoCloudRuleNative {
     std::vector<std::string> excludes;
     // Sibling extension tokens (Steam sub_1384DC5D0 uses space delimiter).
     std::vector<std::string> siblings;
+    // Original exclude/siblings KV, for lossless reinjection into Steam.
+    // Keep scalar/list forms and child names instead of rebuilding filters.
+    std::vector<AppInfoKVNode> filterFields;
 };
 
 struct AutoCloudRootOverrideNative {
@@ -184,15 +196,6 @@ struct AutoCloudRootOverrideNative {
     std::string useInstead;
     std::string addPath;
     std::vector<std::pair<std::string, std::string>> pathTransforms;
-};
-
-struct AppInfoKVNode {
-    std::string key;
-    std::string stringValue;
-    int32_t intValue = 0;
-    bool hasString = false;
-    bool hasInt = false;
-    std::vector<AppInfoKVNode> children;
 };
 
 enum class AutoCloudEffectivePlatform {
