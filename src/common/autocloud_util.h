@@ -12,6 +12,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <utility>
+#include "appinfo_kv.h"
 
 #ifdef _WIN32
 #include <shlobj.h>
@@ -162,15 +163,6 @@ inline std::string ReadCStringFromBytes(const std::vector<uint8_t>& data, size_t
 }
 
 // AutoCloud rule structures
-
-struct AppInfoKVNode {
-    std::string key;
-    std::string stringValue;
-    int32_t intValue = 0;
-    bool hasString = false;
-    bool hasInt = false;
-    std::vector<AppInfoKVNode> children;
-};
 
 struct AutoCloudRuleNative {
     std::string root;

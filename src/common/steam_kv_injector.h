@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include "autocloud_util.h"
+#include "appinfo_kv.h"
 
 namespace SteamKvInjector {
 
